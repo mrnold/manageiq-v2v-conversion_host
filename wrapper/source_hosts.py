@@ -18,6 +18,9 @@ import openstack
 import os
 import subprocess
 import time
+from collections import namedtuple
+
+from .hosts import OpenstackHost
 
 
 def detect_source_host(data, agent_sock):
@@ -27,9 +30,7 @@ def detect_source_host(data, agent_sock):
     return None
 
 class _BaseSourceHost(object):
-    """ Interface for source hosts, currently just prepare and close. """
-
-    # Interface
+    """ Interface for source hosts. """
 
     def prepare_exports(self):
         """ Creates the nbdkit exports from the migration source. """
@@ -39,26 +40,49 @@ class _BaseSourceHost(object):
         """ Stops the nbdkit exports on the migration source. """
         logging.info('No cleanup needed for this migration source.')
 
+    def transfer_exports(self, host):
+        """ Performs a data copy to a destination host. """
+        logging.info('No transfer ability for this migration source.')
 
+    def avoid_wrapper(self, host):
+        """ Decide whether or not to avoid running virt-v2v. """
+        logging.info('No reason to avoid virt-v2v from this migration source.')
+        return True
+
+
+VolumeMapping = namedtuple('VolumeMapping', ['source_dev', 'source_id',
+    'dest_dev', 'dest_id', 'size', 'url'])
 class OpenStackSourceHost(_BaseSourceHost):
     """ Export volumes from an OpenStack instance. """
 
     def __init__(self, data, agent_sock):
+        osp_arg_list = ['auth_url', 'username', 'password',
+                        'project_name', 'project_domain_name',
+                        'user_domain_name', 'verify']
         osp_env = data['osp_source_environment']
-        osp_arg_list = ["auth_url", "username", "password",
-                        "project_name", "project_domain_name",
-                        "user_domain_name", "verify"]
         osp_args = {arg: osp_env[arg] for arg in osp_arg_list}
         self.source_converter = osp_env['conversion_vm_id']
         self.source_instance = osp_env['vm_id']
         self.conn = openstack.connect(**osp_args)
+
+        osp_arg_list = ['os-auth_url', 'os-username', 'os-password',
+                        'os-project_name', 'os-project_domain_name',
+                        'os-user_domain_name', 'os-verify']
+        osp_env = data['osp_environment']
+        osp_args = {arg[3:]: osp_env[arg] for arg in osp_arg_list} # Trim 'os-'
+        self.dest_converter = data['osp_server_id']
+        self.dest_conn = openstack.connect(**osp_args)
+
         self.agent_sock = agent_sock
         self.exported = False
         openstack.enable_logging()
 
+        self.volume_map = {}
+
     def prepare_exports(self):
         """ Attach the source VM's volumes to the source conversion host. """
         self._test_ssh_connection()
+        self._test_dest_ssh_connection()
         self._shutdown_source_vm()
         self.root_volume_id, self.data_volume_ids = \
                 self._get_root_and_data_volumes()
@@ -76,6 +100,22 @@ class OpenStackSourceHost(_BaseSourceHost):
             self._detach_volumes_from_converter()
             self._attach_data_volumes_to_source()
             self.exported = False
+
+    def transfer_exports(self, host):
+        #if self.exported:
+        logging.info('Testing connection to self...')
+        self._test_dest_ssh_connection()
+        self._create_destination_volumes()
+        self._attach_destination_volumes()
+        self._convert_destination_volumes()
+        self._detach_destination_volumes()
+
+    def avoid_wrapper(self, host):
+        """ Assume OpenStack to OpenStack migrations are always KVM to KVM. """
+        if isinstance(host, OpenstackHost):
+            logging.info('OpenStack->OpenStack migration, skipping virt-v2v.')
+            return True
+        return False
 
     def _source_vm(self):
         """
@@ -151,6 +191,33 @@ class OpenStackSourceHost(_BaseSourceHost):
             return True
         return False
 
+    def _destination(self):
+        """ Same idea as _source_vm. """
+        return self.dest_conn.get_server_by_id(self.dest_converter)
+
+    def _destination_out(self, args):
+        """ Run a command on the dest conversion host and get the output. """
+        environment = os.environ.copy()
+        environment['SSH_AUTH_SOCK'] = self.agent_sock
+        command = [
+            'ssh',
+            '-o', 'BatchMode=yes',
+            '-o', 'StrictHostKeyChecking=no', 
+            '-o', 'ConnectTimeout=10',
+            'cloud-user@'+self._destination().accessIPv4
+            ]
+        command.extend(args)
+        return subprocess.check_output(command, env=environment)
+
+    def _test_dest_ssh_connection(self):
+        """ Quick SSH connectivity check. """
+        out = self._destination_out(['echo conn']).decode('utf-8')
+        if out == 'conn':
+            logging.info('Dest contacted okay.')
+            return True
+        logging.info('No connection to podman host: '+out)
+        return False
+
     def _shutdown_source_vm(self):
         """ Shut down the migration source VM before moving its volumes. """
         server = self.conn.compute.get_server(self._source_vm().id)
@@ -167,10 +234,14 @@ class OpenStackSourceHost(_BaseSourceHost):
         sourcevm = self._source_vm()
 
         # Detach non-root volumes
-        for volume in self.data_volume_ids:
-            v = self.conn.get_volume_by_id(volume)
+        for volume_id in self.data_volume_ids:
+            volume = self.conn.get_volume_by_id(volume_id)
+            dev_path = volume.attachments[0].device # TODO: validate attachment
+            self.volume_map[dev_path] = VolumeMapping(source_dev=None,
+                source_id=volume.id, dest_dev=None, dest_id=None,
+                size=volume.size, url=None)
             logging.info('Detaching %s from %s', volume, sourcevm.id)
-            self.conn.detach_volume(server=sourcevm, volume=v, wait=True)
+            self.conn.detach_volume(server=sourcevm, volume=volume, wait=True)
 
         # Create a snapshot of the root volume
         logging.info('Creating root device snapshot')
@@ -184,6 +255,10 @@ class OpenStackSourceHost(_BaseSourceHost):
                 name='rhosp-migration-{}'.format(self.root_volume_id),
                 snapshot_id=root_snapshot.id,
                 size=root_snapshot.size)
+        self.volume_map['/dev/vda'] = VolumeMapping(source_dev=None,
+            source_id=root_volume_copy.id, dest_dev=None, dest_id=None,
+            size=root_volume_copy.size, url=None)
+        logging.info('Volume map so far: %s', self.volume_map)
         return root_volume_copy, root_snapshot
 
     def _get_root_and_data_volumes(self):
@@ -230,15 +305,19 @@ class OpenStackSourceHost(_BaseSourceHost):
         device_list = []
         port_map = {}
         port = 10809
-        for volume_id in [self.root_volume_copy.id] + self.data_volume_ids:
+        for path, mapping in self.volume_map.items():
+            volume_id = mapping.source_id
             volume = self.conn.get_volume_by_id(volume_id)
-            dev_path = volume.attachments[0].device
+            dev_path = volume.attachments[0].device # TODO: validate attachment
             uci_dev_path = dev_path + '-v2v'
             logging.info('Exporting device %s...', dev_path)
             port_map[uci_dev_path] = port
             forward_ports.extend(['-L', '{0}:localhost:{0}'.format(port)])
             nbd_ports.extend(['-p', '{0}:{0}'.format(port)])
             device_list.extend(['--device', dev_path + ':' + uci_dev_path])
+            self.volume_map[path] = mapping._replace(source_dev=dev_path,
+                url='nbd://localhost:'+str(port))
+            logging.info('Volume map so far: %s', self.volume_map)
             port += 1
 
         # Get SSH to forward the NBD ports to localhost
@@ -284,8 +363,7 @@ class OpenStackSourceHost(_BaseSourceHost):
         try:
             out = self._converter_out(['sudo', 'podman', 'stop', self.uci_id])
             logging.info('Closed NBD export with result: %s', out)
-            if self.forwarding_process:
-                self.forwarding_process.terminate()
+            self.forwarding_process.terminate()
         except Exception as error:
             pass
 
@@ -305,6 +383,7 @@ class OpenStackSourceHost(_BaseSourceHost):
                         logging.info('Detached.')
                 else:
                     logging.info('Attachment is not part of current VM?')
+        time.sleep(5)
 
     def _attach_data_volumes_to_source(self):
         """ Clean up the copy of the root volume and reattach data volumes. """
@@ -323,3 +402,43 @@ class OpenStackSourceHost(_BaseSourceHost):
             logging.info('Attaching %s back to source VM...', volume_id)
             self.conn.attach_volume(volume=volume, wait=True,
                     server=self._source_vm())
+
+    def _create_destination_volumes(self): 
+        logging.info('Creating volumes on destination cloud')
+        for path, mapping in self.volume_map.items():
+            volume_id = mapping.source_id
+            volume = self.conn.get_volume_by_id(volume_id)
+            new_volume = self.dest_conn.create_volume(name=volume.name,
+                bootable=volume.bootable, description=volume.description,
+                size=volume.size, wait=True)
+            self.volume_map[path] = mapping._replace(dest_id=new_volume.id)
+
+    def _attach_destination_volumes(self):
+        logging.info('Attaching volumes to destination wrapper')
+        for path, mapping in self.volume_map.items():
+            volume_id = mapping.dest_id
+            volume = self.dest_conn.get_volume_by_id(volume_id)
+            self.dest_conn.attach_volume(volume=volume, wait=True,
+                server=self._destination())
+            logging.info('Waiting for volume to appear in destination wrapper')
+            time.sleep(20)
+            volume = self.dest_conn.get_volume_by_id(volume_id)
+            dev_path = volume.attachments[0].device # TODO: validate attachment
+            self.volume_map[path] = mapping._replace(dest_dev=dev_path)
+        time.sleep(5)
+
+    def _convert_destination_volumes(self):
+        logging.info('Converting volumes...')
+        cmd = ['qemu-img', 'convert', '-p', '-f', 'raw', '-O', 'host_device']
+        for path, mapping in self.volume_map.items():
+            logging.info('Converting source VM\'s %s: %s', path, str(mapping))
+            out = subprocess.check_output(cmd+[mapping.url, mapping.dest_dev])
+            logging.info('Result: %s', out)
+
+    def _detach_destination_volumes(self):
+        logging.info('Detaching volumes from destination wrapper.')
+        for path, mapping in self.volume_map.items():
+            volume_id = mapping.dest_id
+            volume = self.dest_conn.get_volume_by_id(volume_id)
+            self.dest_conn.detach_volume(volume=volume, wait=True,
+                server=self._destination())
