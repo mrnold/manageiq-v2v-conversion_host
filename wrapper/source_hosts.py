@@ -49,6 +49,11 @@ class _BaseSourceHost(object):
         logging.info('No reason to avoid virt-v2v from this migration source.')
         return True
 
+    def get_disk_ids(self):
+        """ Get the list of volumes ready for a new VM. """
+        logging.info('This migration source provides no disk list.')
+        return {}
+
 
 VolumeMapping = namedtuple('VolumeMapping', ['source_dev', 'source_id',
     'dest_dev', 'dest_id', 'size', 'url'])
@@ -67,7 +72,7 @@ class OpenStackSourceHost(_BaseSourceHost):
 
         osp_arg_list = ['os-auth_url', 'os-username', 'os-password',
                         'os-project_name', 'os-project_domain_name',
-                        'os-user_domain_name', 'os-verify']
+                        'os-user_domain_name']
         osp_env = data['osp_environment']
         osp_args = {arg[3:]: osp_env[arg] for arg in osp_arg_list} # Trim 'os-'
         self.dest_converter = data['osp_server_id']
@@ -339,7 +344,7 @@ class OpenStackSourceHost(_BaseSourceHost):
         ssh_args.extend(['-v', '/v2v:/data:z'])
         ssh_args.extend(nbd_ports)
         ssh_args.extend(device_list)
-        ssh_args.extend(['6c7527c9f744', '/usr/local/bin/entrypoint'])
+        ssh_args.extend(['localhost/v2v-updater', '/usr/local/bin/entrypoint'])
         self.uci_id = self._converter_out(ssh_args).strip()
         self.uci_id = self.uci_id.decode('utf-8')
         logging.debug('Source UCI container ID: %s', self.uci_id)
@@ -442,3 +447,10 @@ class OpenStackSourceHost(_BaseSourceHost):
             volume = self.dest_conn.get_volume_by_id(volume_id)
             self.dest_conn.detach_volume(volume=volume, wait=True,
                 server=self._destination())
+
+    def get_disk_ids(self):
+        disk_ids = {}
+        for path, mapping in self.volume_map.items():
+            volume_id = mapping.dest_id
+            disk_ids[path] = volume_id
+        return disk_ids
