@@ -372,6 +372,7 @@ def main():
                 wrapper(host, data, virt_v2v_caps, agent_sock)
         if source_host:
             source_host.close_exports()
+            STATE.internal['disk_ids'] = source_host.get_disk_ids()
         if agent_pid is not None:
             os.kill(agent_pid, signal.SIGTERM)
 
