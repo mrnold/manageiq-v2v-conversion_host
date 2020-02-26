@@ -76,6 +76,10 @@ class OpenStackSourceHost(_BaseSourceHost):
         osp_env = data['osp_environment']
         osp_args = {arg[3:]: osp_env[arg] for arg in osp_arg_list} # Trim 'os-'
         self.dest_converter = data['osp_server_id']
+        if 'insecure_connection' in data:
+            osp_args['verify'] = not data['insecure_connection']
+        else:
+            osp_args['verify'] = False
         self.dest_conn = openstack.connect(**osp_args)
 
         self.agent_sock = agent_sock
