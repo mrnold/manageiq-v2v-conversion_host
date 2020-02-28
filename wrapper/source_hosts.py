@@ -86,6 +86,7 @@ class OpenStackSourceHost(_BaseSourceHost):
         self.exported = False
         openstack.enable_logging()
 
+        # Build up a list of VolumeMappings keyed by the original device path
         self.volume_map = {}
 
     def prepare_exports(self):
@@ -438,11 +439,33 @@ class OpenStackSourceHost(_BaseSourceHost):
 
     def _convert_destination_volumes(self):
         logging.info('Converting volumes...')
-        cmd = ['qemu-img', 'convert', '-p', '-f', 'raw', '-O', 'host_device']
         for path, mapping in self.volume_map.items():
             logging.info('Converting source VM\'s %s: %s', path, str(mapping))
-            out = subprocess.check_output(cmd+[mapping.url, mapping.dest_dev])
-            logging.info('Result: %s', out)
+            overlay = '/tmp/'+os.path.basename(mapping.dest_dev)+'.qcow2'
+            try:
+                logging.info('Attempting initial sparsify...')
+                environment = os.environ.copy()
+                environment['LIBGUESTFS_BACKEND'] = 'direct'
+                cmd = ['qemu-img', 'create', '-f', 'qcow2', '-b', mapping.url,
+                    overlay]
+                out = subprocess.check_output(cmd)
+                logging.info('Overlay output: %s', out)
+                logging.info('Overlay size: %s', str(os.path.getsize(overlay)))
+                cmd = ['virt-sparsify', '--in-place', overlay]
+                out = subprocess.check_output(cmd, env=environment)
+                logging.info('Sparsify output: %s', out)
+                cmd = ['qemu-img', 'convert', '-p', '-f', 'qcow2', '-O',
+                        'host_device', overlay, mapping.dest_dev]
+                out = subprocess.check_output(cmd)
+                logging.info('Conversion output: %s', out)
+            except Exception as error:
+                logging.info('Sparsify failed, converting whole device...')
+                if os.path.isfile(overlay):
+                    os.remove(overlay)
+                cmd = ['qemu-img', 'convert', '-p', '-f', 'raw', '-O',
+                    'host_device', mapping.url, mapping.dest_dev]
+                out = subprocess.check_output(cmd)
+                logging.info('Result: %s', out)
 
     def _detach_destination_volumes(self):
         logging.info('Detaching volumes from destination wrapper.')
