@@ -21,6 +21,7 @@ import time
 from collections import namedtuple
 
 from .hosts import OpenstackHost
+from .state import STATE
 
 
 def detect_source_host(data, agent_sock):
@@ -92,7 +93,6 @@ class OpenStackSourceHost(_BaseSourceHost):
     def prepare_exports(self):
         """ Attach the source VM's volumes to the source conversion host. """
         self._test_ssh_connection()
-        self._test_dest_ssh_connection()
         self._shutdown_source_vm()
         self.root_volume_id, self.data_volume_ids = \
                 self._get_root_and_data_volumes()
@@ -112,9 +112,6 @@ class OpenStackSourceHost(_BaseSourceHost):
             self.exported = False
 
     def transfer_exports(self, host):
-        #if self.exported:
-        logging.info('Testing connection to self...')
-        self._test_dest_ssh_connection()
         self._create_destination_volumes()
         self._attach_destination_volumes()
         self._convert_destination_volumes()
@@ -135,97 +132,64 @@ class OpenStackSourceHost(_BaseSourceHost):
         return self.conn.get_server_by_id(self.source_instance)
 
     def _converter(self):
-        """ Same idea as _source_vm. """
+        """ Same idea as _source_vm, for source conversion host. """
         return self.conn.get_server_by_id(self.source_converter)
 
-    def _converter_out(self, args):
-        """ Run a command on the source conversion host and get the output. """
-        environment = os.environ.copy()
-        environment['SSH_AUTH_SOCK'] = self.agent_sock
-        command = [
-            'ssh',
+    def _destination(self):
+        """ Same idea as _source_vm, for destination conversion host. """
+        return self.dest_conn.get_server_by_id(self.dest_converter)
+
+    def _ssh_args(self):
+        """ Provide default set of SSH options. """
+        return [
             '-o', 'BatchMode=yes',
             '-o', 'StrictHostKeyChecking=no', 
             '-o', 'ConnectTimeout=10',
-            'cloud-user@'+self._converter().accessIPv4
-            ]
+        ]
+
+    def _ssh_cmd(self, address, args):
+        """ Build an SSH command and environment using the running agent. """
+        environment = os.environ.copy()
+        environment['SSH_AUTH_SOCK'] = self.agent_sock
+        command = ['ssh']
+        command.extend(self._ssh_args())
+        command.extend(['cloud-user@'+address])
         command.extend(args)
+        return command, environment
+
+    def _converter_out(self, args):
+        """ Run a command on the source conversion host and get the output. """
+        address = self._converter().accessIPv4
+        command, environment = self._ssh_cmd(address, args)
         return subprocess.check_output(command, env=environment)
 
     def _converter_val(self, args):
         """ Run a command on the source conversion host and get return code. """
-        environment = os.environ.copy()
-        environment['SSH_AUTH_SOCK'] = self.agent_sock
-        command = [
-            'ssh',
-            '-o', 'BatchMode=yes',
-            '-o', 'StrictHostKeyChecking=no', 
-            '-o', 'ConnectTimeout=10',
-            'cloud-user@'+self._converter().accessIPv4
-            ]
-        command.extend(args)
+        address = self._converter().accessIPv4
+        command, environment = self._ssh_cmd(address, args)
         return subprocess.call(command, env=environment)
+
+    def _converter_sub(self, args):
+        """ Run a long-running command on the source conversion host. """
+        address = self._converter().accessIPv4
+        command, environment = self._ssh_cmd(address, args)
+        return subprocess.Popen(command, env=environment)
 
     def _converter_scp(self, source, dest):
         """ Copy a file to the source conversion host. """
         environment = os.environ.copy()
         environment['SSH_AUTH_SOCK'] = self.agent_sock
-        command = [
-            'scp',
-            '-o', 'BatchMode=yes',
-            '-o', 'StrictHostKeyChecking=no', 
-            '-o', 'ConnectTimeout=10',
-            source,
-            'cloud-user@'+self._converter().accessIPv4+':'+dest
-            ]
+        address = self._converter().accessIPv4
+        command = ['scp']
+        command.extend(self._ssh_args())
+        command.extend([source, 'cloud-user@'+address+':'+dest])
         return subprocess.check_output(command, env=environment)
 
-    def _converter_sub(self, args):
-        """ Run a long-running command on the source conversion host. """
-        environment = os.environ.copy()
-        environment['SSH_AUTH_SOCK'] = self.agent_sock
-        command = [
-            'ssh',
-            '-o', 'BatchMode=yes',
-            '-o', 'StrictHostKeyChecking=no', 
-            '-o', 'ConnectTimeout=10',
-            'cloud-user@'+self._converter().accessIPv4
-            ]
-        command.extend(args)
-        return subprocess.Popen(command, env=environment)
-
     def _test_ssh_connection(self):
-        """ Quick SSH connectivity check. """
+        """ Quick SSH connectivity check for source conversion host. """
         out = self._converter_out(['echo conn'])
         if out.strip() == 'conn':
             return True
-        return False
-
-    def _destination(self):
-        """ Same idea as _source_vm. """
-        return self.dest_conn.get_server_by_id(self.dest_converter)
-
-    def _destination_out(self, args):
-        """ Run a command on the dest conversion host and get the output. """
-        environment = os.environ.copy()
-        environment['SSH_AUTH_SOCK'] = self.agent_sock
-        command = [
-            'ssh',
-            '-o', 'BatchMode=yes',
-            '-o', 'StrictHostKeyChecking=no', 
-            '-o', 'ConnectTimeout=10',
-            'cloud-user@'+self._destination().accessIPv4
-            ]
-        command.extend(args)
-        return subprocess.check_output(command, env=environment)
-
-    def _test_dest_ssh_connection(self):
-        """ Quick SSH connectivity check. """
-        out = self._destination_out(['echo conn']).decode('utf-8')
-        if out == 'conn':
-            logging.info('Dest contacted okay.')
-            return True
-        logging.info('No connection to podman host: '+out)
         return False
 
     def _shutdown_source_vm(self):
@@ -446,18 +410,27 @@ class OpenStackSourceHost(_BaseSourceHost):
                 logging.info('Attempting initial sparsify...')
                 environment = os.environ.copy()
                 environment['LIBGUESTFS_BACKEND'] = 'direct'
+
                 cmd = ['qemu-img', 'create', '-f', 'qcow2', '-b', mapping.url,
                     overlay]
                 out = subprocess.check_output(cmd)
                 logging.info('Overlay output: %s', out)
                 logging.info('Overlay size: %s', str(os.path.getsize(overlay)))
+
                 cmd = ['virt-sparsify', '--in-place', overlay]
                 out = subprocess.check_output(cmd, env=environment)
                 logging.info('Sparsify output: %s', out)
+
                 cmd = ['qemu-img', 'convert', '-p', '-f', 'qcow2', '-O',
                         'host_device', overlay, mapping.dest_dev]
-                out = subprocess.check_output(cmd)
-                logging.info('Conversion output: %s', out)
+                logging.info('Status from qemu-img:')
+                with open(STATE.wrapper_log, 'a') as log_fd:
+                    img_sub = subprocess.Popen(cmd,
+                        stdout=log_fd,
+                        stderr=subprocess.STDOUT,
+                        stdin=subprocess.DEVNULL)
+                    returncode = img_sub.wait()
+                    logging.info('Conversion return code: %d', returncode)
             except Exception as error:
                 logging.info('Sparsify failed, converting whole device...')
                 if os.path.isfile(overlay):
