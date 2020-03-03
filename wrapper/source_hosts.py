@@ -12,6 +12,12 @@ module will take care of copying the data from those exports to their final
 migration destination.
 """
 
+# TODO: rename to something more accurate than source_hosts
+# TODO: change the container this module launches in the source conversion host
+# TODO: formalize nbdready signal
+# TODO: make sure ports are unused before proceeding (flock in source UCI)
+# TODO: provide transfer progress in state file
+
 import json
 import logging
 import openstack
@@ -51,7 +57,10 @@ class _BaseSourceHost(object):
         return True
 
     def get_disk_ids(self):
-        """ Get the list of volumes ready for a new VM. """
+        """
+        Get the list of volumes ready for a new VM, in the format expected by
+        the disk_ids list in STATE.internal.
+        """
         logging.info('This migration source provides no disk list.')
         return {}
 
@@ -85,7 +94,7 @@ class OpenStackSourceHost(_BaseSourceHost):
 
         self.agent_sock = agent_sock
         self.exported = False
-        openstack.enable_logging()
+        openstack.enable_logging() # Lots of openstacksdk messages without this
 
         # Build up a list of VolumeMappings keyed by the original device path
         self.volume_map = {}
@@ -100,7 +109,7 @@ class OpenStackSourceHost(_BaseSourceHost):
                 self._detach_data_volumes_from_source()
         self._attach_volumes_to_converter()
         self._export_volumes_from_converter()
-        self.exported = True
+        self.exported = True # TODO: something better than this
 
     def close_exports(self):
         """ Put the source VM's volumes back where they were. """
@@ -200,6 +209,12 @@ class OpenStackSourceHost(_BaseSourceHost):
             logging.info('Waiting 300s for source VM to stop...')
             self.conn.compute.wait_for_server(server, 'SHUTOFF', wait=300)
 
+    def _get_attachment(self, volume, vm):
+        for attachment in volume.attachments:
+            if attachment.server_id == vm.id:
+                return attachment
+        raise RuntimeError('Volume is not attached to the specified instance!')
+
     def _detach_data_volumes_from_source(self):
         """
         Detach data volumes from source VM, and pretend to "detach" the boot
@@ -210,7 +225,7 @@ class OpenStackSourceHost(_BaseSourceHost):
         # Detach non-root volumes
         for volume_id in self.data_volume_ids:
             volume = self.conn.get_volume_by_id(volume_id)
-            dev_path = volume.attachments[0].device # TODO: validate attachment
+            dev_path = self._get_attachment(volume, sourcevm).device
             self.volume_map[dev_path] = VolumeMapping(source_dev=None,
                 source_id=volume.id, dest_dev=None, dest_id=None,
                 size=volume.size, url=None)
@@ -282,7 +297,7 @@ class OpenStackSourceHost(_BaseSourceHost):
         for path, mapping in self.volume_map.items():
             volume_id = mapping.source_id
             volume = self.conn.get_volume_by_id(volume_id)
-            dev_path = volume.attachments[0].device # TODO: validate attachment
+            dev_path = self._get_attachment(volume, self._converter()).device
             uci_dev_path = dev_path + '-v2v'
             logging.info('Exporting device %s...', dev_path)
             port_map[uci_dev_path] = port
@@ -397,7 +412,7 @@ class OpenStackSourceHost(_BaseSourceHost):
             logging.info('Waiting for volume to appear in destination wrapper')
             time.sleep(20)
             volume = self.dest_conn.get_volume_by_id(volume_id)
-            dev_path = volume.attachments[0].device # TODO: validate attachment
+            dev_path = self._get_attachment(volume, self._destination()).device
             self.volume_map[path] = mapping._replace(dest_dev=dev_path)
         time.sleep(5)
 
@@ -406,6 +421,19 @@ class OpenStackSourceHost(_BaseSourceHost):
         for path, mapping in self.volume_map.items():
             logging.info('Converting source VM\'s %s: %s', path, str(mapping))
             overlay = '/tmp/'+os.path.basename(mapping.dest_dev)+'.qcow2'
+
+            def _log_convert(source_disk, source_format):
+                cmd = ['qemu-img', 'convert', '-p', '-f', source_format, '-O',
+                        'host_device', source_disk, mapping.dest_dev]
+                logging.info('Status from qemu-img:')
+                with open(STATE.wrapper_log, 'a') as log_fd:
+                    img_sub = subprocess.Popen(cmd,
+                        stdout=log_fd,
+                        stderr=subprocess.STDOUT,
+                        stdin=subprocess.DEVNULL)
+                    returncode = img_sub.wait()
+                    logging.info('Conversion return code: %d', returncode)
+
             try:
                 logging.info('Attempting initial sparsify...')
                 environment = os.environ.copy()
@@ -421,24 +449,12 @@ class OpenStackSourceHost(_BaseSourceHost):
                 out = subprocess.check_output(cmd, env=environment)
                 logging.info('Sparsify output: %s', out)
 
-                cmd = ['qemu-img', 'convert', '-p', '-f', 'qcow2', '-O',
-                        'host_device', overlay, mapping.dest_dev]
-                logging.info('Status from qemu-img:')
-                with open(STATE.wrapper_log, 'a') as log_fd:
-                    img_sub = subprocess.Popen(cmd,
-                        stdout=log_fd,
-                        stderr=subprocess.STDOUT,
-                        stdin=subprocess.DEVNULL)
-                    returncode = img_sub.wait()
-                    logging.info('Conversion return code: %d', returncode)
+                _log_convert(overlay, 'qcow2')
             except Exception as error:
                 logging.info('Sparsify failed, converting whole device...')
                 if os.path.isfile(overlay):
                     os.remove(overlay)
-                cmd = ['qemu-img', 'convert', '-p', '-f', 'raw', '-O',
-                    'host_device', mapping.url, mapping.dest_dev]
-                out = subprocess.check_output(cmd)
-                logging.info('Result: %s', out)
+                _log_convert(mapping.url, 'raw')
 
     def _detach_destination_volumes(self):
         logging.info('Detaching volumes from destination wrapper.')
