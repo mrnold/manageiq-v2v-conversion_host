@@ -9,14 +9,24 @@ VM, attach its volumes to a source conversion host, and export the volumes from
 inside the conversion host via nbdkit. The OpenStackSourceHost class will take
 care of the process up to this point, and some other class in the regular hosts
 module will take care of copying the data from those exports to their final
-migration destination.
+migration destination. There is an exception for KVM-to-KVM migrations though,
+because those aren't supposed to use virt-v2v - in this case, this module will
+transfer the data itself instead of calling the main wrapper function.
 """
 
-# TODO: rename to something more accurate than source_hosts
+# TODO: rename to something more accurate than source_hosts, fix documentation
 # TODO: change the container this module launches in the source conversion host
 # TODO: formalize nbdready signal
 # TODO: make sure ports are unused before proceeding (flock in source UCI)
 # TODO: provide transfer progress in state file
+# TODO: make sure to attach new volumes in sorted order
+# TODO: wait for volume attachments instead of sleeping
+# TODO: generate individual temporary directory
+# TODO: remove need for root_volume_copy?
+# TODO: document volume mapping buildup sequence
+# TODO: build a list of cleanup actions
+# TODO: clarify source vm, source/destination conversion hosts, and dest vm
+# TODO: check volume/snapshot quota up front
 
 import json
 import logging
@@ -65,12 +75,21 @@ class _BaseSourceHost(object):
         return {}
 
 
-VolumeMapping = namedtuple('VolumeMapping', ['source_dev', 'source_id',
-    'dest_dev', 'dest_id', 'size', 'url'])
+VolumeMapping = namedtuple('VolumeMapping',
+    ['source_dev', # Device path (like /dev/vdb) on source conversion host
+     'source_id', # Volume ID on source conversion host
+     'dest_dev', # Device path on destination conversion host
+     'dest_id', # Volume ID on destination conversion host
+     'size', # Volume size reported by OpenStack, in GB
+     'url' # Final NBD export address from source conversion host
+    ])
 class OpenStackSourceHost(_BaseSourceHost):
     """ Export volumes from an OpenStack instance. """
 
     def __init__(self, data, agent_sock):
+        self.default_timeout = 600 # Maximum wait for openstacksdk operations
+
+        # Create a connection to the source cloud
         osp_arg_list = ['auth_url', 'username', 'password',
                         'project_name', 'project_domain_name',
                         'user_domain_name', 'verify']
@@ -80,6 +99,7 @@ class OpenStackSourceHost(_BaseSourceHost):
         self.source_instance = osp_env['vm_id']
         self.conn = openstack.connect(**osp_args)
 
+        # Create a connection to the destination cloud
         osp_arg_list = ['os-auth_url', 'os-username', 'os-password',
                         'os-project_name', 'os-project_domain_name',
                         'os-user_domain_name']
@@ -103,10 +123,8 @@ class OpenStackSourceHost(_BaseSourceHost):
         """ Attach the source VM's volumes to the source conversion host. """
         self._test_ssh_connection()
         self._shutdown_source_vm()
-        self.root_volume_id, self.data_volume_ids = \
-                self._get_root_and_data_volumes()
-        self.root_volume_copy, self.root_snapshot = \
-                self._detach_data_volumes_from_source()
+        self._get_root_and_data_volumes()
+        self._detach_data_volumes_from_source()
         self._attach_volumes_to_converter()
         self._export_volumes_from_converter()
         self.exported = True # TODO: something better than this
@@ -215,68 +233,68 @@ class OpenStackSourceHost(_BaseSourceHost):
                 return attachment
         raise RuntimeError('Volume is not attached to the specified instance!')
 
-    def _detach_data_volumes_from_source(self):
+    def _get_root_and_data_volumes(self):
         """
-        Detach data volumes from source VM, and pretend to "detach" the boot
-        volume by creating a new volume from a snapshot of the VM.
+        Volume mapping step one: get the IDs and sizes of all volumes on the
+        source VM. Key off the original device path to eventually preserve this
+        order on the destination.
         """
         sourcevm = self._source_vm()
-
-        # Detach non-root volumes
-        for volume_id in self.data_volume_ids:
-            volume = self.conn.get_volume_by_id(volume_id)
+        for server_volume in sourcevm.volumes:
+            volume = self.conn.get_volume_by_id(server_volume['id'])
+            logging.info('Inspecting volume: %s', volume.id)
             dev_path = self._get_attachment(volume, sourcevm).device
             self.volume_map[dev_path] = VolumeMapping(source_dev=None,
                 source_id=volume.id, dest_dev=None, dest_id=None,
                 size=volume.size, url=None)
-            logging.info('Detaching %s from %s', volume, sourcevm.id)
-            self.conn.detach_volume(server=sourcevm, volume=volume, wait=True)
 
-        # Create a snapshot of the root volume
-        logging.info('Creating root device snapshot')
-        root_snapshot = self.conn.create_volume_snapshot(force=True, wait=True,
-                name='rhosp-migration-{}'.format(self.root_volume_id),
-                volume_id=self.root_volume_id)
+    def _detach_data_volumes_from_source(self):
+        """
+        Detach data volumes from source VM, and pretend to "detach" the boot
+        volume by creating a new volume from a snapshot of the VM. Volume map
+        step two: replace boot disk ID with this new volume's ID.
+        """
+        sourcevm = self._source_vm()
+        for path, mapping in self.volume_map.items():
+            volume_id = mapping.source_id
+            volume = self.conn.get_volume_by_id(volume_id)
+            if path == '/dev/vda':
+                # Create a snapshot of the root volume
+                logging.info('Creating root device snapshot')
+                root_snapshot = self.conn.create_volume_snapshot(force=True,
+                    wait=True, name='rhosp-migration-{}'.format(volume_id),
+                    volume_id=volume_id, timeout=self.default_timeout)
+                self.root_snapshot = root_snapshot
 
-        # Create a new volume from the snapshot
-        logging.info('Creating new volume from root snapshot')
-        root_volume_copy = self.conn.create_volume(wait=True,
-                name='rhosp-migration-{}'.format(self.root_volume_id),
-                snapshot_id=root_snapshot.id,
-                size=root_snapshot.size)
-        self.volume_map['/dev/vda'] = VolumeMapping(source_dev=None,
-            source_id=root_volume_copy.id, dest_dev=None, dest_id=None,
-            size=root_volume_copy.size, url=None)
-        logging.info('Volume map so far: %s', self.volume_map)
-        return root_volume_copy, root_snapshot
+                # Create a new volume from the snapshot
+                logging.info('Creating new volume from root snapshot')
+                root_volume_copy = self.conn.create_volume(wait=True,
+                        name='rhosp-migration-{}'.format(volume_id),
+                        snapshot_id=root_snapshot.id,
+                        size=root_snapshot.size,
+                        timeout=self.default_timeout)
+                self.root_volume_copy = root_volume_copy
 
-    def _get_root_and_data_volumes(self):
-        """ Get the IDs of the boot and data volumes on the source VM. """
-        root_volume_id = None
-        data_volume_ids = []
-        for volume in self._source_vm().volumes:
-            logging.info('Inspecting volume: %s', volume['id'])
-            v = self.conn.volume.get_volume(volume['id'])
-            for attachment in v.attachments:
-                if attachment['server_id'] == self._source_vm().id:
-                    if attachment['device'] == '/dev/vda':
-                        logging.info('Assuming this volume is the root disk')
-                        root_volume_id = attachment['volume_id']
-                    else:
-                        logging.info('Assuming this is a data volume')
-                        data_volume_ids.append(attachment['volume_id'])
-                else:
-                    logging.info('Attachment is not part of current VM?')
-        return root_volume_id, data_volume_ids
+                # Update the volume map with the new volume ID
+                self.volume_map[path] = mapping._replace(
+                    source_id=root_volume_copy.id)
+            else: # Detach non-root volumes
+                logging.info('Detaching %s from %s', volume, sourcevm.id)
+                self.conn.detach_volume(server=sourcevm, volume=volume,
+                    wait=True, timeout=self.default_timeout)
+
+    def _wait_for_volume_dev_path(self, volume, vm, empty=False):
+        attachment = self._get_attachment(vm, volume)
 
     def _attach_volumes_to_converter(self):
         """ Attach all the source volumes to the conversion host """
-        conversion_volume_ids = [self.root_volume_copy.id]+self.data_volume_ids
-        for volume_id in conversion_volume_ids:
+        for path, mapping in self.volume_map.items():
+            volume_id = mapping.source_id
             volume = self.conn.get_volume_by_id(volume_id)
             logging.info('Attaching %s to conversion host...', volume_id)
-            self.conn.attach_volume(server=self._converter(), volume=volume)
-            time.sleep(15) # TODO: wait until actually attached
+            self.conn.attach_volume(server=self._converter(), volume=volume,
+                wait=True, timeout=self.default_timeout)
+            time.sleep(15) # TODO: wait until actually attached and has devpath
 
     def _export_volumes_from_converter(self):
         """
@@ -368,7 +386,8 @@ class OpenStackSourceHost(_BaseSourceHost):
                     else:
                         logging.info('This volume is a data disk for this VM')
                         self.conn.detach_volume(server=self._converter(),
-                                volume=v, wait=True)
+                                wait=True, timeout=self.default_timeout,
+                                volume=v)
                         logging.info('Detached.')
                 else:
                     logging.info('Attachment is not part of current VM?')
@@ -376,21 +395,22 @@ class OpenStackSourceHost(_BaseSourceHost):
 
     def _attach_data_volumes_to_source(self):
         """ Clean up the copy of the root volume and reattach data volumes. """
-
-        # Delete the copy of the source root disk
-        logging.info('Removing copy of root volume')
-        self.conn.delete_volume(name_or_id=self.root_volume_copy.id, wait=True)
-        logging.info('Deleting root device snapshot')
-        self.conn.delete_volume_snapshot(name_or_id=self.root_snapshot.id,
-                wait=True)
-
-        # Attach data volumes back to source VM
-        logging.info('Re-attaching volumes to source VM...')
-        for volume_id in self.data_volume_ids:
-            volume = self.conn.get_volume_by_id(volume_id)
-            logging.info('Attaching %s back to source VM...', volume_id)
-            self.conn.attach_volume(volume=volume, wait=True,
-                    server=self._source_vm())
+        for path, mapping in self.volume_map.items():
+            if path == '/dev/vda':
+                # Delete the copy of the source root disk
+                logging.info('Removing copy of root volume')
+                self.conn.delete_volume(name_or_id=self.root_volume_copy.id,
+                    wait=True, timeout=self.default_timeout)
+                logging.info('Deleting root device snapshot')
+                self.conn.delete_volume_snapshot(timeout=self.default_timeout,
+                    wait=True, name_or_id=self.root_snapshot.id)
+            else:
+                # Attach data volumes back to source VM
+                logging.info('Re-attaching volumes to source VM...')
+                volume = self.conn.get_volume_by_id(mapping.source_id)
+                logging.info('Attaching %s back to source VM...', volume_id)
+                self.conn.attach_volume(volume=volume, wait=True,
+                    server=self._source_vm(), timeout=self.default_timeout)
 
     def _create_destination_volumes(self): 
         logging.info('Creating volumes on destination cloud')
@@ -399,7 +419,7 @@ class OpenStackSourceHost(_BaseSourceHost):
             volume = self.conn.get_volume_by_id(volume_id)
             new_volume = self.dest_conn.create_volume(name=volume.name,
                 bootable=volume.bootable, description=volume.description,
-                size=volume.size, wait=True)
+                size=volume.size, wait=True, timeout=self.default_timeout)
             self.volume_map[path] = mapping._replace(dest_id=new_volume.id)
 
     def _attach_destination_volumes(self):
@@ -408,7 +428,7 @@ class OpenStackSourceHost(_BaseSourceHost):
             volume_id = mapping.dest_id
             volume = self.dest_conn.get_volume_by_id(volume_id)
             self.dest_conn.attach_volume(volume=volume, wait=True,
-                server=self._destination())
+                server=self._destination(), timeout=self.default_timeout)
             logging.info('Waiting for volume to appear in destination wrapper')
             time.sleep(20)
             volume = self.dest_conn.get_volume_by_id(volume_id)
@@ -462,7 +482,7 @@ class OpenStackSourceHost(_BaseSourceHost):
             volume_id = mapping.dest_id
             volume = self.dest_conn.get_volume_by_id(volume_id)
             self.dest_conn.detach_volume(volume=volume, wait=True,
-                server=self._destination())
+                server=self._destination(), timeout=self.default_timeout)
 
     def get_disk_ids(self):
         disk_ids = {}
