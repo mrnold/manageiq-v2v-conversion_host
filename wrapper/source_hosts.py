@@ -19,8 +19,6 @@ transfer the data itself instead of calling the main wrapper function.
 # TODO: formalize nbdready signal
 # TODO: make sure ports are unused before proceeding (flock in source UCI)
 # TODO: provide transfer progress in state file
-# TODO: make sure to attach new volumes in sorted order
-# TODO: wait for volume attachments instead of sleeping
 # TODO: generate individual temporary directory
 # TODO: remove need for root_volume_copy?
 # TODO: document volume mapping buildup sequence
@@ -228,6 +226,10 @@ class OpenStackSourceHost(_BaseSourceHost):
             self.conn.compute.wait_for_server(server, 'SHUTOFF', wait=300)
 
     def _get_attachment(self, volume, vm):
+        """
+        Get the attachment object from the volume with the matching server ID.
+        Convenience method for use only when the attachment is already certain.
+        """
         for attachment in volume.attachments:
             if attachment.server_id == vm.id:
                 return attachment
@@ -283,8 +285,16 @@ class OpenStackSourceHost(_BaseSourceHost):
                 self.conn.detach_volume(server=sourcevm, volume=volume,
                     wait=True, timeout=self.default_timeout)
 
-    def _wait_for_volume_dev_path(self, volume, vm, empty=False):
-        attachment = self._get_attachment(vm, volume)
+    def _wait_for_volume_dev_path(self, conn, volume, vm, timeout):
+        volume_id = volume.id
+        for second in range(timeout):
+            volume = conn.get_volume_by_id(volume_id)
+            if volume.attachments:
+                attachment = self._get_attachment(volume, vm)
+                if attachment.device.startswith('/dev/'):
+                    return
+            time.sleep(1)
+        raise RuntimeError('Timed out waiting for volume device path!')
 
     def _attach_volumes_to_converter(self):
         """ Attach all the source volumes to the conversion host """
@@ -294,7 +304,8 @@ class OpenStackSourceHost(_BaseSourceHost):
             logging.info('Attaching %s to conversion host...', volume_id)
             self.conn.attach_volume(server=self._converter(), volume=volume,
                 wait=True, timeout=self.default_timeout)
-            time.sleep(15) # TODO: wait until actually attached and has devpath
+            self._wait_for_volume_dev_path(self.conn, volume,
+                self._converter(), self.default_timeout)
 
     def _export_volumes_from_converter(self):
         """
@@ -374,24 +385,32 @@ class OpenStackSourceHost(_BaseSourceHost):
         except Exception as error:
             pass
 
+    def _still_attached(self, volume, vm):
+        """ Check if a volume is still attached to a VM. """
+        for attachment in volume.attachments:
+            if attachment.server_id == vm.id:
+                return True
+        return False
+
     def _detach_volumes_from_converter(self):
         """ Detach volumes from conversion host. """
-        for volume in self._converter().volumes:
-            logging.info('Inspecting volume %s', volume["id"])
-            v = self.conn.volume.get_volume(volume["id"])
-            for attachment in v.attachments:
-                if attachment["server_id"] == self._converter().id:
-                    if attachment["device"] == "/dev/vda":
-                        logging.info('This is the root volume for this VM')
-                    else:
-                        logging.info('This volume is a data disk for this VM')
-                        self.conn.detach_volume(server=self._converter(),
-                                wait=True, timeout=self.default_timeout,
-                                volume=v)
-                        logging.info('Detached.')
-                else:
-                    logging.info('Attachment is not part of current VM?')
-        time.sleep(5)
+        sourcevm = self._converter()
+        for path, mapping in self.volume_map.items():
+            volume = self.conn.get_volume_by_id(mapping.source_id)
+            logging.info('Inspecting volume %s', volume.id)
+            attachment = self._get_attachment(volume, sourcevm)
+            if attachment.device == "/dev/vda":
+                logging.info('This is the root volume for this VM')
+            else:
+                logging.info('This volume is a data disk for this VM')
+                self.conn.detach_volume(server=sourcevm, wait=True,
+                    timeout=self.default_timeout, volume=volume)
+                for second in range(self.default_timeout):
+                    volume = self.conn.get_volume_by_id(mapping.source_id)
+                    if not self._still_attached(volume, sourcevm):
+                        return
+                raise RuntimeError('Timed out waiting to detach volumes '
+                    'from source conversion host!')
 
     def _attach_data_volumes_to_source(self):
         """ Clean up the copy of the root volume and reattach data volumes. """
@@ -424,17 +443,17 @@ class OpenStackSourceHost(_BaseSourceHost):
 
     def _attach_destination_volumes(self):
         logging.info('Attaching volumes to destination wrapper')
-        for path, mapping in self.volume_map.items():
+        for path, mapping in sorted(self.volume_map.items()):
             volume_id = mapping.dest_id
             volume = self.dest_conn.get_volume_by_id(volume_id)
             self.dest_conn.attach_volume(volume=volume, wait=True,
                 server=self._destination(), timeout=self.default_timeout)
             logging.info('Waiting for volume to appear in destination wrapper')
-            time.sleep(20)
+            self._wait_for_volume_dev_path(self.dest_conn, volume,
+                self._destination(), self.default_timeout)
             volume = self.dest_conn.get_volume_by_id(volume_id)
             dev_path = self._get_attachment(volume, self._destination()).device
             self.volume_map[path] = mapping._replace(dest_dev=dev_path)
-        time.sleep(5)
 
     def _convert_destination_volumes(self):
         logging.info('Converting volumes...')
@@ -485,6 +504,7 @@ class OpenStackSourceHost(_BaseSourceHost):
                 server=self._destination(), timeout=self.default_timeout)
 
     def get_disk_ids(self):
+        """ Return a list of disks as expected by STATE.internal['disk_ids'] """
         disk_ids = {}
         for path, mapping in self.volume_map.items():
             volume_id = mapping.dest_id
