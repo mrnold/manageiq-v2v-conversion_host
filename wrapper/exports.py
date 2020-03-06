@@ -15,17 +15,27 @@ the actual nbdkit exports.
 
 import json
 import logging
+import os
 import signal
 import subprocess
 import sys
 import time
 
+from .source_hosts import NBD_READY_SENTINEL, DEFAULT_TIMEOUT
+
 
 def export_nbd(port_map):
+    """
+    Start one nbdkit process for every disk in the JSON input. Intended to be
+    run inside a UCI container inside a source conversion host.
+    """
+    log_format = '%(asctime)s:%(levelname)s:' \
+        + ' %(message)s (%(module)s:%(lineno)d)'
     logging.basicConfig(
         level=logging.DEBUG,
-        filename='/data/exports.log', 
-        filemode='w')
+        filename='/data/virt-v2v-wrapper.log',
+        filemode='w',
+        format=log_format)
     logger = logging.getLogger()
     stdout_handler = logging.StreamHandler(sys.stdout)
     stderr_handler = logging.StreamHandler(sys.stderr)
@@ -37,14 +47,12 @@ def export_nbd(port_map):
     processes = {}
     for disk, port in port_map.items():
         logging.info('Exporting %s over NBD, port %s', disk, str(port))
-        cmd = [
-            'nbdkit', '--exit-with-parent',
-            '-p', str(port), 'file', disk
-        ]
+        cmd = ['nbdkit', '--exit-with-parent', '-p', str(port), 'file', disk]
         processes[disk] = subprocess.Popen(cmd)
 
     # Check qemu-img info on all the disks to make sure everything is ready
-    while True:
+    logging.info('Waiting for valid qemu-img info on all exports...')
+    for second in range(DEFAULT_TIMEOUT):
         try:
             for disk, port in port_map.items():
                 cmd = ['qemu-img', 'info', 'nbd://localhost:{}'.format(port)]
@@ -57,9 +65,14 @@ def export_nbd(port_map):
         else:
             logging.info('All volume exports ready.')
             break
+    else:
+        raise RuntimeError('Timed out starting nbdkit exports!')
 
-    # Signal readiness (TODO)
-    with open('/data/nbdready', 'w') as ready:
+    # Signal readiness by writing out an 'nbdready' file. The wrapper running
+    # on the destination conversion host will poll for this file before trying
+    # to do anything with the NBD export URL.
+    sentinel = os.path.join('/data', NBD_READY_SENTINEL)
+    with open(sentinel, 'w') as ready:
         ready.write('NBD exports ready')
 
     # Wait until told to stop
