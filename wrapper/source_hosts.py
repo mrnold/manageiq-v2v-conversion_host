@@ -14,16 +14,11 @@ because those aren't supposed to use virt-v2v - in this case, this module will
 transfer the data itself instead of calling the main wrapper function.
 """
 
-# TODO: rename to something more accurate than source_hosts, fix documentation
 # TODO: change the container this module launches in the source conversion host
-# TODO: formalize nbdready signal
 # TODO: make sure ports are unused before proceeding (flock in source UCI)
 # TODO: provide transfer progress in state file
-# TODO: generate individual temporary directory
 # TODO: remove need for root_volume_copy?
-# TODO: document volume mapping buildup sequence
 # TODO: build a list of cleanup actions
-# TODO: clarify source vm, source/destination conversion hosts, and dest vm
 # TODO: check volume/snapshot quota up front
 
 import json
@@ -37,6 +32,8 @@ from collections import namedtuple
 from .hosts import OpenstackHost
 from .state import STATE
 
+NBD_READY_SENTINEL = 'nbdready' # Created when nbdkit exports are ready
+DEFAULT_TIMEOUT = 600           # Maximum wait for openstacksdk operations
 
 def detect_source_host(data, agent_sock):
     """ Create the right source host object based on the input data. """
@@ -85,8 +82,6 @@ class OpenStackSourceHost(_BaseSourceHost):
     """ Export volumes from an OpenStack instance. """
 
     def __init__(self, data, agent_sock):
-        self.default_timeout = 600 # Maximum wait for openstacksdk operations
-
         # Create a connection to the source cloud
         osp_arg_list = ['auth_url', 'username', 'password',
                         'project_name', 'project_domain_name',
@@ -186,10 +181,11 @@ class OpenStackSourceHost(_BaseSourceHost):
         """ Run a command on the source conversion host and get the output. """
         address = self._converter().accessIPv4
         command, environment = self._ssh_cmd(address, args)
-        return subprocess.check_output(command, env=environment)
+        output = subprocess.check_output(command, env=environment)
+        return output.decode('utf-8').strip()
 
     def _converter_val(self, args):
-        """ Run a command on the source conversion host and get return code. """
+        """ Run a command on the source conversion host and get return code """
         address = self._converter().accessIPv4
         command, environment = self._ssh_cmd(address, args)
         return subprocess.call(command, env=environment)
@@ -222,8 +218,9 @@ class OpenStackSourceHost(_BaseSourceHost):
         server = self.conn.compute.get_server(self._source_vm().id)
         if server.status != 'SHUTOFF':
             self.conn.compute.stop_server(server=server)
-            logging.info('Waiting 300s for source VM to stop...')
-            self.conn.compute.wait_for_server(server, 'SHUTOFF', wait=300)
+            logging.info('Waiting for source VM to stop...')
+            self.conn.compute.wait_for_server(server, 'SHUTOFF',
+                wait=DEFAULT_TIMEOUT)
 
     def _get_attachment(self, volume, vm):
         """
@@ -265,7 +262,7 @@ class OpenStackSourceHost(_BaseSourceHost):
                 logging.info('Creating root device snapshot')
                 root_snapshot = self.conn.create_volume_snapshot(force=True,
                     wait=True, name='rhosp-migration-{}'.format(volume_id),
-                    volume_id=volume_id, timeout=self.default_timeout)
+                    volume_id=volume_id, timeout=DEFAULT_TIMEOUT)
                 self.root_snapshot = root_snapshot
 
                 # Create a new volume from the snapshot
@@ -274,7 +271,7 @@ class OpenStackSourceHost(_BaseSourceHost):
                         name='rhosp-migration-{}'.format(volume_id),
                         snapshot_id=root_snapshot.id,
                         size=root_snapshot.size,
-                        timeout=self.default_timeout)
+                        timeout=DEFAULT_TIMEOUT)
                 self.root_volume_copy = root_volume_copy
 
                 # Update the volume map with the new volume ID
@@ -283,7 +280,7 @@ class OpenStackSourceHost(_BaseSourceHost):
             else: # Detach non-root volumes
                 logging.info('Detaching %s from %s', volume, sourcevm.id)
                 self.conn.detach_volume(server=sourcevm, volume=volume,
-                    wait=True, timeout=self.default_timeout)
+                    wait=True, timeout=DEFAULT_TIMEOUT)
 
     def _wait_for_volume_dev_path(self, conn, volume, vm, timeout):
         volume_id = volume.id
@@ -303,18 +300,24 @@ class OpenStackSourceHost(_BaseSourceHost):
             volume = self.conn.get_volume_by_id(volume_id)
             logging.info('Attaching %s to conversion host...', volume_id)
             self.conn.attach_volume(server=self._converter(), volume=volume,
-                wait=True, timeout=self.default_timeout)
+                wait=True, timeout=DEFAULT_TIMEOUT)
             self._wait_for_volume_dev_path(self.conn, volume,
-                self._converter(), self.default_timeout)
+                self._converter(), DEFAULT_TIMEOUT)
 
     def _export_volumes_from_converter(self):
         """
         SSH to source conversion host and start an NBD export. Start the UCI
         with /dev/vdb, /dev/vdc, etc. attached, then pass JSON input to request
         nbdkit exports from the V2V wrapper. Find free ports up front so they
-        can be passed to the container (TODO).
+        can be passed to the container (TODO). Volume mapping step 3: fill in
+        the volume's device path on the source conversion host, and the URL to
+        its NBD export.
         """
         logging.info('Exporting volumes from source conversion host...')
+
+        # Create a temporary directory on source conversion host
+        tmpdir = self._converter_out(['mktemp', '-d', '-t', 'v2v-XXXXXX'])
+        logging.info('Source conversion host temp dir: %s', tmpdir)
 
         # Expose and forward the ports we are going to tell nbdkit to use
         ssh_args = []
@@ -342,34 +345,47 @@ class OpenStackSourceHost(_BaseSourceHost):
         self.forwarding_process = self._converter_sub(forward_ports)
 
         # Copy the port map input
-        self._converter_out(['mkdir', '-p', '/v2v/input'])
+        self._converter_val(['mkdir', '-p', tmpdir+'/input'])
         ports = json.dumps({'nbd_export_only': port_map})
         nbd_conversion = '/tmp/nbd_conversion.json'
         with open(nbd_conversion, 'w+') as conversion:
             conversion.write(ports)
-        self._converter_scp(nbd_conversion, '/v2v/input/conversion.json')
-        self._converter_out(['rm', '-f', '/v2v/uci.id'])
+        self._converter_scp(nbd_conversion, tmpdir+'/input/conversion.json')
+
+        # TODO: remove this, temporary update mechanism for development only
+        self._converter_val(['mkdir', '-p', tmpdir+'/update'])
+        self._converter_val(['mv', '/v2v/update/v2v-conversion-host.tar.gz',
+            tmpdir+'/update/v2v-conversion-host.tar.gz'])
 
         # Run UCI on source conversion host. Create a temporary directory to
-        # use as the UCI's /data directory (TODO). That way more than one can
-        # run at a time.
+        # use as the UCI's /data directory so more than one can run at a time.
         ssh_args.extend(['sudo', 'podman', 'run', '--detach'])
-        ssh_args.extend(['-v', '/v2v:/data:z'])
+        ssh_args.extend(['-v', tmpdir+':/data:z'])
         ssh_args.extend(nbd_ports)
         ssh_args.extend(device_list)
         ssh_args.extend(['localhost/v2v-updater', '/usr/local/bin/entrypoint'])
-        self.uci_id = self._converter_out(ssh_args).strip()
-        self.uci_id = self.uci_id.decode('utf-8')
+        self.uci_id = self._converter_out(ssh_args)
         logging.debug('Source UCI container ID: %s', self.uci_id)
 
-        # Make sure export worked by checking the exports
+        # Make sure export worked by checking the exports. The conversion host
+        # on the source should create an 'nbdready' file after it has started
+        # all the nbdkit processes, and after that qemu-img info should be able
+        # to read them.
         logging.info('Waiting for NBD exports from source container...')
-        while self._converter_val(['test', '-f', '/v2v/nbdready']) != 0:
-            time.sleep(5)
+        sentinel = os.path.join(tmpdir, NBD_READY_SENTINEL)
+        for second in range(DEFAULT_TIMEOUT):
+            if self._converter_val(['test', '-f', sentinel]) == 0:
+                break
+            time.sleep(1)
+        else:
+            raise RuntimeError('Timed out waiting for NBD export!')
         for disk, port in port_map.items():
             cmd = ['qemu-img', 'info', 'nbd://localhost:{}'.format(port)]
             image_info = subprocess.check_output(cmd)
             logging.info('qemu-img info for %s: %s', disk, image_info)
+
+        # TODO: Remove temporary directory from source conversion host
+        # self._converter_out(['rm', '-rf', tmpdir])
 
     def _converter_close_exports(self):
         """
@@ -385,7 +401,7 @@ class OpenStackSourceHost(_BaseSourceHost):
         except Exception as error:
             pass
 
-    def _still_attached(self, volume, vm):
+    def _volume_still_attached(self, volume, vm):
         """ Check if a volume is still attached to a VM. """
         for attachment in volume.attachments:
             if attachment.server_id == vm.id:
@@ -404,10 +420,10 @@ class OpenStackSourceHost(_BaseSourceHost):
             else:
                 logging.info('This volume is a data disk for this VM')
                 self.conn.detach_volume(server=sourcevm, wait=True,
-                    timeout=self.default_timeout, volume=volume)
-                for second in range(self.default_timeout):
+                    timeout=DEFAULT_TIMEOUT, volume=volume)
+                for second in range(DEFAULT_TIMEOUT):
                     volume = self.conn.get_volume_by_id(mapping.source_id)
-                    if not self._still_attached(volume, sourcevm):
+                    if not self._volume_still_attached(volume, sourcevm):
                         return
                 raise RuntimeError('Timed out waiting to detach volumes '
                     'from source conversion host!')
@@ -419,9 +435,9 @@ class OpenStackSourceHost(_BaseSourceHost):
                 # Delete the copy of the source root disk
                 logging.info('Removing copy of root volume')
                 self.conn.delete_volume(name_or_id=self.root_volume_copy.id,
-                    wait=True, timeout=self.default_timeout)
+                    wait=True, timeout=DEFAULT_TIMEOUT)
                 logging.info('Deleting root device snapshot')
-                self.conn.delete_volume_snapshot(timeout=self.default_timeout,
+                self.conn.delete_volume_snapshot(timeout=DEFAULT_TIMEOUT,
                     wait=True, name_or_id=self.root_snapshot.id)
             else:
                 # Attach data volumes back to source VM
@@ -429,39 +445,53 @@ class OpenStackSourceHost(_BaseSourceHost):
                 volume = self.conn.get_volume_by_id(mapping.source_id)
                 logging.info('Attaching %s back to source VM...', volume_id)
                 self.conn.attach_volume(volume=volume, wait=True,
-                    server=self._source_vm(), timeout=self.default_timeout)
+                    server=self._source_vm(), timeout=DEFAULT_TIMEOUT)
 
     def _create_destination_volumes(self): 
+        """
+        Volume mapping step 4: create new volumes on the destination OpenStack,
+        and fill in dest_id with the new volumes.
+        """
         logging.info('Creating volumes on destination cloud')
         for path, mapping in self.volume_map.items():
             volume_id = mapping.source_id
             volume = self.conn.get_volume_by_id(volume_id)
             new_volume = self.dest_conn.create_volume(name=volume.name,
                 bootable=volume.bootable, description=volume.description,
-                size=volume.size, wait=True, timeout=self.default_timeout)
+                size=volume.size, wait=True, timeout=DEFAULT_TIMEOUT)
             self.volume_map[path] = mapping._replace(dest_id=new_volume.id)
 
     def _attach_destination_volumes(self):
+        """
+        Volume mapping step 5: attach the new destination volumes to the
+        destination conversion host. Fill in the destination device name.
+        """
         logging.info('Attaching volumes to destination wrapper')
         for path, mapping in sorted(self.volume_map.items()):
             volume_id = mapping.dest_id
             volume = self.dest_conn.get_volume_by_id(volume_id)
             self.dest_conn.attach_volume(volume=volume, wait=True,
-                server=self._destination(), timeout=self.default_timeout)
+                server=self._destination(), timeout=DEFAULT_TIMEOUT)
             logging.info('Waiting for volume to appear in destination wrapper')
             self._wait_for_volume_dev_path(self.dest_conn, volume,
-                self._destination(), self.default_timeout)
+                self._destination(), DEFAULT_TIMEOUT)
             volume = self.dest_conn.get_volume_by_id(volume_id)
             dev_path = self._get_attachment(volume, self._destination()).device
             self.volume_map[path] = mapping._replace(dest_dev=dev_path)
 
     def _convert_destination_volumes(self):
+        """
+        Finally run the commands to copy the exported source volumes to the
+        local destination volumes. Attempt to sparsify the volumes to minimize
+        the amount of data sent over the network.
+        """
         logging.info('Converting volumes...')
         for path, mapping in self.volume_map.items():
             logging.info('Converting source VM\'s %s: %s', path, str(mapping))
             overlay = '/tmp/'+os.path.basename(mapping.dest_dev)+'.qcow2'
 
             def _log_convert(source_disk, source_format):
+                """ Write qemu-img convert progress to the wrapper log. """
                 cmd = ['qemu-img', 'convert', '-p', '-f', source_format, '-O',
                         'host_device', source_disk, mapping.dest_dev]
                 logging.info('Status from qemu-img:')
@@ -472,6 +502,8 @@ class OpenStackSourceHost(_BaseSourceHost):
                         stdin=subprocess.DEVNULL)
                     returncode = img_sub.wait()
                     logging.info('Conversion return code: %d', returncode)
+                    if returncode != 0:
+                        raise RuntimeError('Failed to convert volume!')
 
             try:
                 logging.info('Attempting initial sparsify...')
@@ -496,15 +528,16 @@ class OpenStackSourceHost(_BaseSourceHost):
                 _log_convert(mapping.url, 'raw')
 
     def _detach_destination_volumes(self):
+        """ Disconnect new volumes from destination conversion host. """
         logging.info('Detaching volumes from destination wrapper.')
         for path, mapping in self.volume_map.items():
             volume_id = mapping.dest_id
             volume = self.dest_conn.get_volume_by_id(volume_id)
             self.dest_conn.detach_volume(volume=volume, wait=True,
-                server=self._destination(), timeout=self.default_timeout)
+                server=self._destination(), timeout=DEFAULT_TIMEOUT)
 
     def get_disk_ids(self):
-        """ Return a list of disks as expected by STATE.internal['disk_ids'] """
+        """ Return a list of disks as expected by STATE.internal's disk_ids """
         disk_ids = {}
         for path, mapping in self.volume_map.items():
             volume_id = mapping.dest_id
