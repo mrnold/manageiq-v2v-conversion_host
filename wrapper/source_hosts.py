@@ -17,7 +17,6 @@ transfer the data itself instead of calling the main wrapper function.
 # TODO: change the container this module launches in the source conversion host
 # TODO: make sure ports are unused before proceeding (flock in source UCI)
 # TODO: provide transfer progress in state file
-# TODO: remove need for root_volume_copy?
 # TODO: build a list of cleanup actions
 # TODO: check volume/snapshot quota up front
 
@@ -75,6 +74,7 @@ VolumeMapping = namedtuple('VolumeMapping',
      'source_id', # Volume ID on source conversion host
      'dest_dev', # Device path on destination conversion host
      'dest_id', # Volume ID on destination conversion host
+     'snap_id', # Root volumes need snapshot+new volume, so record snapshot ID
      'size', # Volume size reported by OpenStack, in GB
      'url' # Final NBD export address from source conversion host
     ])
@@ -245,13 +245,14 @@ class OpenStackSourceHost(_BaseSourceHost):
             dev_path = self._get_attachment(volume, sourcevm).device
             self.volume_map[dev_path] = VolumeMapping(source_dev=None,
                 source_id=volume.id, dest_dev=None, dest_id=None,
-                size=volume.size, url=None)
+                snap_id=None, size=volume.size, url=None)
 
     def _detach_data_volumes_from_source(self):
         """
         Detach data volumes from source VM, and pretend to "detach" the boot
         volume by creating a new volume from a snapshot of the VM. Volume map
-        step two: replace boot disk ID with this new volume's ID.
+        step two: replace boot disk ID with this new volume's ID, and record
+        snapshot ID for later deletion.
         """
         sourcevm = self._source_vm()
         for path, mapping in self.volume_map.items():
@@ -263,7 +264,6 @@ class OpenStackSourceHost(_BaseSourceHost):
                 root_snapshot = self.conn.create_volume_snapshot(force=True,
                     wait=True, name='rhosp-migration-{}'.format(volume_id),
                     volume_id=volume_id, timeout=DEFAULT_TIMEOUT)
-                self.root_snapshot = root_snapshot
 
                 # Create a new volume from the snapshot
                 logging.info('Creating new volume from root snapshot')
@@ -272,11 +272,12 @@ class OpenStackSourceHost(_BaseSourceHost):
                         snapshot_id=root_snapshot.id,
                         size=root_snapshot.size,
                         timeout=DEFAULT_TIMEOUT)
-                self.root_volume_copy = root_volume_copy
 
                 # Update the volume map with the new volume ID
                 self.volume_map[path] = mapping._replace(
-                    source_id=root_volume_copy.id)
+                    source_id=root_volume_copy.id,
+                    snap_id=root_snapshot.id)
+
             else: # Detach non-root volumes
                 logging.info('Detaching %s from %s', volume, sourcevm.id)
                 self.conn.detach_volume(server=sourcevm, volume=volume,
@@ -309,9 +310,9 @@ class OpenStackSourceHost(_BaseSourceHost):
         SSH to source conversion host and start an NBD export. Start the UCI
         with /dev/vdb, /dev/vdc, etc. attached, then pass JSON input to request
         nbdkit exports from the V2V wrapper. Find free ports up front so they
-        can be passed to the container (TODO). Volume mapping step 3: fill in
-        the volume's device path on the source conversion host, and the URL to
-        its NBD export.
+        can be passed to the container. Volume mapping step 3: fill in the
+        volume's device path on the source conversion host, and the URL to its
+        NBD export.
         """
         logging.info('Exporting volumes from source conversion host...')
 
@@ -432,13 +433,15 @@ class OpenStackSourceHost(_BaseSourceHost):
         """ Clean up the copy of the root volume and reattach data volumes. """
         for path, mapping in self.volume_map.items():
             if path == '/dev/vda':
-                # Delete the copy of the source root disk
+                # Delete the temporary copy of the source root disk
                 logging.info('Removing copy of root volume')
-                self.conn.delete_volume(name_or_id=self.root_volume_copy.id,
+                self.conn.delete_volume(name_or_id=mapping.source_id,
                     wait=True, timeout=DEFAULT_TIMEOUT)
-                logging.info('Deleting root device snapshot')
+
+                # Remove the root volume snapshot
+                logging.info('Deleting temporary root device snapshot')
                 self.conn.delete_volume_snapshot(timeout=DEFAULT_TIMEOUT,
-                    wait=True, name_or_id=self.root_snapshot.id)
+                    wait=True, name_or_id=mapping.snap_id)
             else:
                 # Attach data volumes back to source VM
                 logging.info('Re-attaching volumes to source VM...')
