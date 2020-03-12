@@ -15,15 +15,18 @@ transfer the data itself instead of calling the main wrapper function.
 """
 
 # TODO: change the container this module launches in the source conversion host
-# TODO: make sure ports are unused before proceeding (flock in source UCI)
 # TODO: provide transfer progress in state file
 # TODO: build a list of cleanup actions
 # TODO: check volume/snapshot quota up front
+# TODO: handle direct launch from an image, should be able to create dest volume...
+# TODO: name root volumes the same as source root, on destination side
 
+import fcntl
 import json
 import logging
 import openstack
 import os
+import pickle
 import subprocess
 import time
 from collections import namedtuple
@@ -33,6 +36,16 @@ from .state import STATE
 
 NBD_READY_SENTINEL = 'nbdready' # Created when nbdkit exports are ready
 DEFAULT_TIMEOUT = 600           # Maximum wait for openstacksdk operations
+
+# File containing ports used by all the nbdkit processes running on the source
+# conversion host. This is meant to be shared among running containers. There
+# is a check to see if the port is available, but this should speed things up.
+PORT_MAP_FILE = '/var/run/v2v-wrapper-ports'
+PORT_LOCK_FILE = '/var/lock/v2v-wrapper-lock' # Lock for the port map
+
+# Lock to serialize volume attachments. This helps prevent device path
+# mismatches between the OpenStack SDK and /dev in the VM.
+ATTACH_LOCK_FILE = '/var/lock/v2v-volume-lock'
 
 def detect_source_host(data, agent_sock):
     """ Create the right source host object based on the input data. """
@@ -279,7 +292,7 @@ class OpenStackSourceHost(_BaseSourceHost):
                     snap_id=root_snapshot.id)
 
             else: # Detach non-root volumes
-                logging.info('Detaching %s from %s', volume, sourcevm.id)
+                logging.info('Detaching %s from %s', volume.id, sourcevm.id)
                 self.conn.detach_volume(server=sourcevm, volume=volume,
                     wait=True, timeout=DEFAULT_TIMEOUT)
 
@@ -294,8 +307,34 @@ class OpenStackSourceHost(_BaseSourceHost):
             time.sleep(1)
         raise RuntimeError('Timed out waiting for volume device path!')
 
+    def _use_lock(lock_file):
+        """ Boilerplate for functions that need to take a lock. """
+        def _decorate_lock(function):
+            def wait_for_lock(self):
+                with open(lock_file, 'wb+') as lock:
+                    for second in range(DEFAULT_TIMEOUT):
+                        try:
+                            logging.info('Waiting for lock %s...', lock_file)
+                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except OSError as error:
+                            logging.info('Another conversion has the lock.')
+                            time.sleep(1)
+                    else:
+                        raise RuntimeError('Unable to acquire lock %s!',
+                            lock_file)
+                    try:
+                        function(self)
+                    finally:
+                        fcntl.flock(lock, fcntl.LOCK_UN)
+            return wait_for_lock
+        return _decorate_lock
+
+    @_use_lock(ATTACH_LOCK_FILE)
     def _attach_volumes_to_converter(self):
         """ Attach all the source volumes to the conversion host """
+        # Lock this part to have a better chance of the OpenStack device path
+        # matching the device path seen inside the conversion host.
         for path, mapping in self.volume_map.items():
             volume_id = mapping.source_id
             volume = self.conn.get_volume_by_id(volume_id)
@@ -305,6 +344,17 @@ class OpenStackSourceHost(_BaseSourceHost):
             self._wait_for_volume_dev_path(self.conn, volume,
                 self._converter(), DEFAULT_TIMEOUT)
 
+    def _test_port_available(self, port):
+        """
+        See if a port is open on the source conversion host by trying to listen
+        on it.
+        """
+        result = self._converter_val(['timeout', '1', 'nc', '-l', str(port)])
+        return result == 124 # Returned by 'timeout' when command timed out,
+                             # meaning nc was successful and the port is free.
+
+
+    @_use_lock(PORT_LOCK_FILE)
     def _export_volumes_from_converter(self):
         """
         SSH to source conversion host and start an NBD export. Start the UCI
@@ -320,74 +370,120 @@ class OpenStackSourceHost(_BaseSourceHost):
         tmpdir = self._converter_out(['mktemp', '-d', '-t', 'v2v-XXXXXX'])
         logging.info('Source conversion host temp dir: %s', tmpdir)
 
-        # Expose and forward the ports we are going to tell nbdkit to use
-        ssh_args = []
-        nbd_ports = []
-        forward_ports = ['-N', '-T']
-        device_list = []
-        port_map = {}
-        port = 10809
-        for path, mapping in self.volume_map.items():
-            volume_id = mapping.source_id
-            volume = self.conn.get_volume_by_id(volume_id)
-            dev_path = self._get_attachment(volume, self._converter()).device
-            uci_dev_path = dev_path + '-v2v'
-            logging.info('Exporting device %s...', dev_path)
-            port_map[uci_dev_path] = port
-            forward_ports.extend(['-L', '{0}:localhost:{0}'.format(port)])
-            nbd_ports.extend(['-p', '{0}:{0}'.format(port)])
-            device_list.extend(['--device', dev_path + ':' + uci_dev_path])
-            self.volume_map[path] = mapping._replace(source_dev=dev_path,
-                url='nbd://localhost:'+str(port))
-            logging.info('Volume map so far: %s', self.volume_map)
-            port += 1
+        # Reserve ports on the source conversion host. Lock a file containing
+        # the used ports, select some ports from the range that is unused, and
+        # check that the port is available on the source conversion host. Add
+        # this to the locked file and unlock it for the next conversion.
+        if not os.path.exists(PORT_MAP_FILE):
+            try:
+                os.mknod(PORT_MAP_FILE)
+            except FileExistsError as error: # Just in case multiple wrappers
+                pass                         # try to do this at the same time.
+        with open(PORT_MAP_FILE, 'rb+') as port_map_file:
+            # Try to read in the set of used ports
+            try:
+                used_ports = pickle.load(port_map_file)
+            except EOFError as error:
+                logging.info('Unable to read port map from %s, re-initializing'
+                    ' it...', port_map_file.name)
+                used_ports = set()
 
-        # Get SSH to forward the NBD ports to localhost
-        self.forwarding_process = self._converter_sub(forward_ports)
+            logging.info('Currently used ports: %s', str(used_ports))
 
-        # Copy the port map input
-        self._converter_val(['mkdir', '-p', tmpdir+'/input'])
-        ports = json.dumps({'nbd_export_only': port_map})
-        nbd_conversion = '/tmp/nbd_conversion.json'
-        with open(nbd_conversion, 'w+') as conversion:
-            conversion.write(ports)
-        self._converter_scp(nbd_conversion, tmpdir+'/input/conversion.json')
+            # Choose ports from the available possibilities, and try to bind
+            ephemeral_ports = set(range(49152, 65535))
+            available_ports = ephemeral_ports-used_ports
 
-        # TODO: remove this, temporary update mechanism for development only
-        self._converter_val(['mkdir', '-p', tmpdir+'/update'])
-        self._converter_val(['mv', '/v2v/update/v2v-conversion-host.tar.gz',
-            tmpdir+'/update/v2v-conversion-host.tar.gz'])
+            # Expose and forward the ports we are going to tell nbdkit to use
+            nbd_ports = []
+            forward_ports = ['-N', '-T']
+            device_list = []
+            port_map = {}
+            for path, mapping in self.volume_map.items():
+                try:
+                    port = available_ports.pop()
+                    while not self._test_port_available(port):
+                        logging.info('Port %d not available, trying another.')
+                        used_ports.add(port) # Mark used to avoid trying again
+                        port = available_ports.pop()
+                except KeyError as error:
+                    raise RuntimeError('No free ports on conversion host!')
+                used_ports.add(port)
+                logging.info('Allocated port %d, all used: %s', port,
+                    str(used_ports))
 
-        # Run UCI on source conversion host. Create a temporary directory to
-        # use as the UCI's /data directory so more than one can run at a time.
-        ssh_args.extend(['sudo', 'podman', 'run', '--detach'])
-        ssh_args.extend(['-v', tmpdir+':/data:z'])
-        ssh_args.extend(nbd_ports)
-        ssh_args.extend(device_list)
-        ssh_args.extend(['localhost/v2v-updater', '/usr/local/bin/entrypoint'])
-        self.uci_id = self._converter_out(ssh_args)
-        logging.debug('Source UCI container ID: %s', self.uci_id)
+                volume_id = mapping.source_id
+                volume = self.conn.get_volume_by_id(volume_id)
+                attachment = self._get_attachment(volume, self._converter())
+                dev_path = attachment.device
+                uci_dev_path = dev_path + '-v2v'
+                logging.info('Exporting device %s...', dev_path)
+                port_map[uci_dev_path] = port
+                forward_ports.extend(['-L', '{0}:localhost:{0}'.format(port)])
+                nbd_ports.extend(['-p', '{0}:{0}'.format(port)])
+                device_list.extend(['--device', dev_path + ':' + uci_dev_path])
+                self.volume_map[path] = mapping._replace(source_dev=dev_path,
+                    url='nbd://localhost:'+str(port))
+                logging.info('Volume map so far: %s', self.volume_map)
 
-        # Make sure export worked by checking the exports. The conversion host
-        # on the source should create an 'nbdready' file after it has started
-        # all the nbdkit processes, and after that qemu-img info should be able
-        # to read them.
-        logging.info('Waiting for NBD exports from source container...')
-        sentinel = os.path.join(tmpdir, NBD_READY_SENTINEL)
-        for second in range(DEFAULT_TIMEOUT):
-            if self._converter_val(['test', '-f', sentinel]) == 0:
-                break
-            time.sleep(1)
-        else:
-            raise RuntimeError('Timed out waiting for NBD export!')
-        for disk, port in port_map.items():
-            cmd = ['qemu-img', 'info', 'nbd://localhost:{}'.format(port)]
-            image_info = subprocess.check_output(cmd)
-            logging.info('qemu-img info for %s: %s', disk, image_info)
+            # Get SSH to forward the NBD ports to localhost
+            self.forwarding_process = self._converter_sub(forward_ports)
 
-        # TODO: Remove temporary directory from source conversion host
-        # self._converter_out(['rm', '-rf', tmpdir])
+            # Copy the port map input
+            self._converter_val(['mkdir', '-p', tmpdir+'/input'])
+            ports = json.dumps({'nbd_export_only': port_map})
+            nbd_conversion = '/tmp/nbd_conversion.json'
+            with open(nbd_conversion, 'w+') as conversion:
+                conversion.write(ports)
+            self._converter_scp(nbd_conversion,
+                tmpdir+'/input/conversion.json')
 
+            # TODO: remove this, temporary update mechanism for development only
+            self._converter_val(['mkdir', '-p', tmpdir+'/update'])
+            self._converter_val(['cp', '/v2v/update/v2v-conversion-host.tar.gz',
+                tmpdir+'/update/v2v-conversion-host.tar.gz'])
+            self._converter_val(['cp', '/v2v2/update/v2v-conversion-host.tar.gz',
+                tmpdir+'/update/v2v-conversion-host.tar.gz'])
+
+            # Run UCI on source conversion host. Create a temporary directory
+            # to use as the UCI's /data directory so more than one can run at a
+            # time. TODO: change container name to the real thing
+            ssh_args = ['sudo', 'podman', 'run', '--detach']
+            ssh_args.extend(['-v', tmpdir+':/data:z'])
+            ssh_args.extend(nbd_ports)
+            ssh_args.extend(device_list)
+            ssh_args.extend(['localhost/v2v-updater'])
+            ssh_args.extend(['/usr/local/bin/entrypoint'])
+            self.uci_id = self._converter_out(ssh_args)
+            logging.debug('Source UCI container ID: %s', self.uci_id)
+
+            # Make sure export worked by checking the exports. The conversion
+            # host on the source should create an 'nbdready' file after it has
+            # started all the nbdkit processes, and after that qemu-img info
+            # should be able to read them.
+            logging.info('Waiting for NBD exports from source container...')
+            sentinel = os.path.join(tmpdir, NBD_READY_SENTINEL)
+            for second in range(DEFAULT_TIMEOUT):
+                if self._converter_val(['test', '-f', sentinel]) == 0:
+                    break
+                time.sleep(1)
+            else:
+                raise RuntimeError('Timed out waiting for NBD export!')
+            for disk, port in port_map.items():
+                cmd = ['qemu-img', 'info', 'nbd://localhost:{}'.format(port)]
+                image_info = subprocess.check_output(cmd)
+                logging.info('qemu-img info for %s: %s', disk, image_info)
+
+            # Write out and unlock the port map
+            logging.info('Writing out used ports: %s', str(used_ports))
+            pickle.dump(used_ports, port_map_file)
+            os.fsync(port_map_file)
+            port_map_file.close()
+
+            # TODO: Remove temporary directory from source conversion host
+            # self._converter_out(['rm', '-rf', tmpdir])
+
+    @_use_lock(PORT_LOCK_FILE)
     def _converter_close_exports(self):
         """
         SSH to source conversion host and close the NBD export. Currently this
@@ -399,6 +495,25 @@ class OpenStackSourceHost(_BaseSourceHost):
             out = self._converter_out(['sudo', 'podman', 'stop', self.uci_id])
             logging.info('Closed NBD export with result: %s', out)
             self.forwarding_process.terminate()
+            with open(PORT_MAP_FILE, 'rb+') as port_map_file:
+                # Try to read in the set of used ports
+                try:
+                    used_ports = pickle.load(port_map_file)
+                except EOFError as error:
+                    logging.info('Unable to read port map file %s,'
+                        ' re-initializing it...', port_map_file.name)
+                    used_ports = set()
+
+                logging.info('Cleanup: currently used ports: %s', used_ports)
+
+                for path, mapping in self.volume_map:
+                    port = int(mapping.url[-5:])
+                    used_ports.remove(port)
+
+                logging.info('Cleaning used ports: %s', used_ports)
+                pickle.dump(used_ports, port_map_file)
+                os.fsync(port_map_file)
+                port_map_file.close()
         except Exception as error:
             pass
 
@@ -409,29 +524,33 @@ class OpenStackSourceHost(_BaseSourceHost):
                 return True
         return False
 
+    @_use_lock(ATTACH_LOCK_FILE)
     def _detach_volumes_from_converter(self):
         """ Detach volumes from conversion host. """
-        sourcevm = self._converter()
+        converter = self._converter()
         for path, mapping in self.volume_map.items():
             volume = self.conn.get_volume_by_id(mapping.source_id)
             logging.info('Inspecting volume %s', volume.id)
-            attachment = self._get_attachment(volume, sourcevm)
+            attachment = self._get_attachment(volume, converter)
             if attachment.device == "/dev/vda":
                 logging.info('This is the root volume for this VM')
             else:
                 logging.info('This volume is a data disk for this VM')
-                self.conn.detach_volume(server=sourcevm, wait=True,
+                self.conn.detach_volume(server=converter, wait=True,
                     timeout=DEFAULT_TIMEOUT, volume=volume)
                 for second in range(DEFAULT_TIMEOUT):
+                    converter = self._converter()
                     volume = self.conn.get_volume_by_id(mapping.source_id)
-                    if not self._volume_still_attached(volume, sourcevm):
-                        return
-                raise RuntimeError('Timed out waiting to detach volumes '
-                    'from source conversion host!')
+                    if not self._volume_still_attached(volume, converter):
+                        break
+                    time.sleep(1)
+                else:
+                    raise RuntimeError('Timed out waiting to detach volumes '
+                        'from source conversion host!')
 
     def _attach_data_volumes_to_source(self):
         """ Clean up the copy of the root volume and reattach data volumes. """
-        for path, mapping in self.volume_map.items():
+        for path, mapping in sorted(self.volume_map.items()):
             if path == '/dev/vda':
                 # Delete the temporary copy of the source root disk
                 logging.info('Removing copy of root volume')
@@ -446,7 +565,7 @@ class OpenStackSourceHost(_BaseSourceHost):
                 # Attach data volumes back to source VM
                 logging.info('Re-attaching volumes to source VM...')
                 volume = self.conn.get_volume_by_id(mapping.source_id)
-                logging.info('Attaching %s back to source VM...', volume_id)
+                logging.info('Attaching %s back to source VM...', volume.id)
                 self.conn.attach_volume(volume=volume, wait=True,
                     server=self._source_vm(), timeout=DEFAULT_TIMEOUT)
 
