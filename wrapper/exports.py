@@ -57,7 +57,7 @@ def export_nbd(port_map):
             for disk, port in port_map.items():
                 cmd = ['qemu-img', 'info', 'nbd://localhost:{}'.format(port)]
                 image_info = subprocess.check_output(cmd)
-                logging.info('qemu-img info for %s:', disk, image_info)
+                logging.info('qemu-img info for %s: %s', disk, image_info)
         except Exception as error:
             logging.info('Got exception: %s', error)
             logging.info('Trying again.')
