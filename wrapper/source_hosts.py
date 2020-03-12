@@ -373,9 +373,10 @@ class OpenStackSourceHost(_BaseSourceHost):
             attachment = self._get_attachment(volume, self._converter())
             dev_path = attachment.device
             uci_dev_path = dev_path + '-v2v'
-            logging.info('Exporting device %s...', dev_path)
+            logging.info('Exporting device %s, %s', dev_path, volume_id)
             nbd_ports.extend(['-p', '{0}'.format(port)])
             device_list.extend(['--device', dev_path + ':' + uci_dev_path])
+            self.volume_map[path] = mapping._replace(source_dev=dev_path)
             reverse_port_map[port] = path
             port_map[uci_dev_path] = port
             port += 1
@@ -405,7 +406,7 @@ class OpenStackSourceHost(_BaseSourceHost):
         ssh_args = ['sudo', 'podman', 'port', self.uci_id]
         out = self._converter_out(ssh_args)
         forward_ports = ['-N', '-T']
-        for line in out.split('\n'): # Format: 3306/tcp -> 0.0.0.0:3306
+        for line in out.split('\n'): # Format: 10809/tcp -> 0.0.0.0:33437
             logging.debug('Forwarding port from podman: %s', line)
             internal_port, _, _ = line.partition('/')
             _, _, external_port = line.rpartition(':')
@@ -421,8 +422,9 @@ class OpenStackSourceHost(_BaseSourceHost):
             # may look backwards at first glance.
             forward_ports.extend(['-L', '{}:localhost:{}'.format(internal_port,
                 external_port)])
-            self.volume_map[path] = mapping._replace(source_dev=dev_path,
-                url='nbd://localhost:'+internal_port)
+            mapping = self.volume_map[path]
+            url = 'nbd://localhost:'+internal_port
+            self.volume_map[path] = mapping._replace(url=url)
             logging.info('Volume map so far: %s', self.volume_map)
 
         # Get SSH to forward the NBD ports to localhost
