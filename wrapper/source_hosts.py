@@ -19,7 +19,6 @@ transfer the data itself instead of calling the main wrapper function.
 # TODO: build a list of cleanup actions
 # TODO: check volume/snapshot quota up front
 # TODO: handle direct launch from an image, should be able to create dest volume...
-# TODO: name root volumes the same as source root, on destination side
 
 import fcntl
 import json
@@ -88,6 +87,7 @@ VolumeMapping = namedtuple('VolumeMapping',
      'dest_dev', # Device path on destination conversion host
      'dest_id', # Volume ID on destination conversion host
      'snap_id', # Root volumes need snapshot+new volume, so record snapshot ID
+     'name', # Save volume name so root volumes don't look weird on destination
      'size', # Volume size reported by OpenStack, in GB
      'url' # Final NBD export address from source conversion host
     ])
@@ -258,7 +258,7 @@ class OpenStackSourceHost(_BaseSourceHost):
             dev_path = self._get_attachment(volume, sourcevm).device
             self.volume_map[dev_path] = VolumeMapping(source_dev=None,
                 source_id=volume.id, dest_dev=None, dest_id=None,
-                snap_id=None, size=volume.size, url=None)
+                snap_id=None, name=volume.name, size=volume.size, url=None)
 
     def _detach_data_volumes_from_source(self):
         """
@@ -578,7 +578,7 @@ class OpenStackSourceHost(_BaseSourceHost):
         for path, mapping in self.volume_map.items():
             volume_id = mapping.source_id
             volume = self.conn.get_volume_by_id(volume_id)
-            new_volume = self.dest_conn.create_volume(name=volume.name,
+            new_volume = self.dest_conn.create_volume(name=mapping.name,
                 bootable=volume.bootable, description=volume.description,
                 size=volume.size, wait=True, timeout=DEFAULT_TIMEOUT)
             self.volume_map[path] = mapping._replace(dest_id=new_volume.id)
