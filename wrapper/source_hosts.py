@@ -17,8 +17,8 @@ transfer the data itself instead of calling the main wrapper function.
 # TODO: change the container this module launches in the source conversion host
 # TODO: provide transfer progress in state file
 # TODO: build a list of cleanup actions
-# TODO: check volume/snapshot quota up front
 # TODO: handle direct launch from an image, should be able to create dest volume...
+# TODO: better verify that internal disk paths match openstacksdk's
 
 import fcntl
 import json
@@ -80,6 +80,7 @@ VolumeMapping = namedtuple('VolumeMapping',
      'dest_dev', # Device path on destination conversion host
      'dest_id', # Volume ID on destination conversion host
      'snap_id', # Root volumes need snapshot+new volume, so record snapshot ID
+     'image_id', # Direct-from-image VMs create this temporary snapshot image
      'name', # Save volume name so root volumes don't look weird on destination
      'size', # Volume size reported by OpenStack, in GB
      'url' # Final NBD export address from source conversion host
@@ -250,41 +251,68 @@ class OpenStackSourceHost(_BaseSourceHost):
             logging.info('Inspecting volume: %s', volume.id)
             dev_path = self._get_attachment(volume, sourcevm).device
             self.volume_map[dev_path] = VolumeMapping(source_dev=None,
-                source_id=volume.id, dest_dev=None, dest_id=None,
-                snap_id=None, name=volume.name, size=volume.size, url=None)
+                source_id=volume.id, dest_dev=None, dest_id=None, snap_id=None,
+                image_id=None, name=volume.name, size=volume.size, url=None)
 
     def _detach_data_volumes_from_source(self):
         """
         Detach data volumes from source VM, and pretend to "detach" the boot
-        volume by creating a new volume from a snapshot of the VM. Volume map
-        step two: replace boot disk ID with this new volume's ID, and record
-        snapshot ID for later deletion.
+        volume by creating a new volume from a snapshot of the VM. If the VM is
+        booted directly from an image, take a VM snapshot and create the new
+        volume from that snapshot.
+        Volume map step two: replace boot disk ID with this new volume's ID,
+        and record snapshot ID for later deletion.
         """
         sourcevm = self._source_vm()
-        for path, mapping in self.volume_map.items():
+        if '/dev/vda' in self.volume_map:
+            mapping = self.volume_map['/dev/vda']
             volume_id = mapping.source_id
-            volume = self.conn.get_volume_by_id(volume_id)
+
+            # Create a snapshot of the root volume
+            logging.info('Creating root device snapshot')
+            root_snapshot = self.conn.create_volume_snapshot(force=True,
+                wait=True, name='rhosp-migration-{}'.format(volume_id),
+                volume_id=volume_id, timeout=DEFAULT_TIMEOUT)
+
+            # Create a new volume from the snapshot
+            logging.info('Creating new volume from root snapshot')
+            root_volume_copy = self.conn.create_volume(wait=True,
+                    name='rhosp-migration-{}'.format(volume_id),
+                    snapshot_id=root_snapshot.id,
+                    size=root_snapshot.size,
+                    timeout=DEFAULT_TIMEOUT)
+
+            # Update the volume map with the new volume ID
+            self.volume_map['/dev/vda'] = mapping._replace(
+                source_id=root_volume_copy.id,
+                snap_id=root_snapshot.id)
+        elif sourcevm.image:
+            logging.info('Image-based instance, creating snapshot...')
+            image = self.conn.compute.create_server_image(server=sourcevm.id,
+                name='rhosp-migration-root-{}'.format(sourcevm.name))
+            for second in range(DEFAULT_TIMEOUT):
+                refreshed_image = self.conn.get_image_by_id(image.id)
+                if refreshed_image.status == 'active':
+                    break
+                time.sleep(1)
+            else:
+                raise('Could not create new image of image-based instance!')
+            volume = self.conn.create_volume(image=image.id, bootable=True,
+                wait=True, timeout=DEFAULT_TIMEOUT, size=image.min_disk,
+                name=image.name)
+            self.volume_map['/dev/vda'] = VolumeMapping(source_dev='/dev/vda',
+                source_id=volume.id, dest_dev=None, dest_id=None, snap_id=None,
+                image_id=image.id, name=volume.name, size=volume.size,
+                url=None)
+        else:
+            raise('No known boot device found for this instance!')
+
+        for path, mapping in self.volume_map.items():
             if path == '/dev/vda':
-                # Create a snapshot of the root volume
-                logging.info('Creating root device snapshot')
-                root_snapshot = self.conn.create_volume_snapshot(force=True,
-                    wait=True, name='rhosp-migration-{}'.format(volume_id),
-                    volume_id=volume_id, timeout=DEFAULT_TIMEOUT)
-
-                # Create a new volume from the snapshot
-                logging.info('Creating new volume from root snapshot')
-                root_volume_copy = self.conn.create_volume(wait=True,
-                        name='rhosp-migration-{}'.format(volume_id),
-                        snapshot_id=root_snapshot.id,
-                        size=root_snapshot.size,
-                        timeout=DEFAULT_TIMEOUT)
-
-                # Update the volume map with the new volume ID
-                self.volume_map[path] = mapping._replace(
-                    source_id=root_volume_copy.id,
-                    snap_id=root_snapshot.id)
-
+                continue
             else: # Detach non-root volumes
+                volume_id = mapping.source_id
+                volume = self.conn.get_volume_by_id(volume_id)
                 logging.info('Detaching %s from %s', volume.id, sourcevm.id)
                 self.conn.detach_volume(server=sourcevm, volume=volume,
                     wait=True, timeout=DEFAULT_TIMEOUT)
@@ -448,7 +476,7 @@ class OpenStackSourceHost(_BaseSourceHost):
             logging.info('qemu-img info for %s: %s', path, image_info)
 
         # TODO: Remove temporary directory from source conversion host
-        # self._converter_out(['rm', '-rf', tmpdir])
+        self._converter_out(['rm', '-rf', tmpdir])
 
     def _converter_close_exports(self):
         """
@@ -481,6 +509,7 @@ class OpenStackSourceHost(_BaseSourceHost):
             attachment = self._get_attachment(volume, converter)
             if attachment.device == "/dev/vda":
                 logging.info('This is the root volume for this VM')
+                continue
             else:
                 logging.info('This volume is a data disk for this VM')
                 self.conn.detach_volume(server=converter, wait=True,
@@ -505,9 +534,16 @@ class OpenStackSourceHost(_BaseSourceHost):
                     wait=True, timeout=DEFAULT_TIMEOUT)
 
                 # Remove the root volume snapshot
-                logging.info('Deleting temporary root device snapshot')
-                self.conn.delete_volume_snapshot(timeout=DEFAULT_TIMEOUT,
-                    wait=True, name_or_id=mapping.snap_id)
+                if mapping.snap_id:
+                    logging.info('Deleting temporary root device snapshot')
+                    self.conn.delete_volume_snapshot(timeout=DEFAULT_TIMEOUT,
+                        wait=True, name_or_id=mapping.snap_id)
+
+                # Remove root image copy, for image-launched instances
+                if mapping.image_id:
+                    logging.info('Deleting temporary root device image')
+                    self.conn.delete_image(timeout=DEFAULT_TIMEOUT,
+                        wait=True, name_or_id=mapping.image_id)
             else:
                 # Attach data volumes back to source VM
                 logging.info('Re-attaching volumes to source VM...')
