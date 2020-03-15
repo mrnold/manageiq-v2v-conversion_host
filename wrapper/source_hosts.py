@@ -17,8 +17,6 @@ transfer the data itself instead of calling the main wrapper function.
 # TODO: change the container this module launches in the source conversion host
 # TODO: provide transfer progress in state file
 # TODO: build a list of cleanup actions
-# TODO: handle direct launch from an image, should be able to create dest volume...
-# TODO: better verify that internal disk paths match openstacksdk's
 
 import fcntl
 import json
@@ -37,7 +35,8 @@ DEFAULT_TIMEOUT = 600           # Maximum wait for openstacksdk operations
 
 # Lock to serialize volume attachments. This helps prevent device path
 # mismatches between the OpenStack SDK and /dev in the VM.
-ATTACH_LOCK_FILE = '/var/lock/v2v-volume-lock'
+ATTACH_LOCK_FILE_SOURCE = '/var/lock/v2v-source-volume-lock'
+ATTACH_LOCK_FILE_DESTINATION = '/var/lock/v2v-destination-volume-lock'
 
 def detect_source_host(data, agent_sock):
     """ Create the right source host object based on the input data. """
@@ -183,6 +182,13 @@ class OpenStackSourceHost(_BaseSourceHost):
         command.extend(['cloud-user@'+address])
         command.extend(args)
         return command, environment
+
+    def _destination_out(self, args):
+        """ Run a command on the dest conversion host and get the output. """
+        address = self._destination().accessIPv4
+        command, environment = self._ssh_cmd(address, args)
+        output = subprocess.check_output(command, env=environment)
+        return output.decode('utf-8').strip()
 
     def _converter_out(self, args):
         """ Run a command on the source conversion host and get the output. """
@@ -351,7 +357,7 @@ class OpenStackSourceHost(_BaseSourceHost):
             return wait_for_lock
         return _decorate_lock
 
-    @_use_lock(ATTACH_LOCK_FILE)
+    @_use_lock(ATTACH_LOCK_FILE_SOURCE)
     def _attach_volumes_to_converter(self):
         """ Attach all the source volumes to the conversion host """
         # Lock this part to have a better chance of the OpenStack device path
@@ -360,10 +366,34 @@ class OpenStackSourceHost(_BaseSourceHost):
             volume_id = mapping.source_id
             volume = self.conn.get_volume_by_id(volume_id)
             logging.info('Attaching %s to conversion host...', volume_id)
+
+            disks_before = self._converter_out(['lsblk', '--noheadings',
+                '--list', '--paths', '--nodeps', '--output NAME'])
+            disks_before = set(disks_before.split())
+            logging.debug('Initial disk list: %s', disks_before)
+
             self.conn.attach_volume(server=self._converter(), volume=volume,
                 wait=True, timeout=DEFAULT_TIMEOUT)
+            logging.info('Waiting for volume to appear in source wrapper')
             self._wait_for_volume_dev_path(self.conn, volume,
                 self._converter(), DEFAULT_TIMEOUT)
+
+            disks_after = self._converter_out(['lsblk', '--noheadings',
+                '--list', '--paths', '--nodeps', '--output NAME'])
+            disks_after = set(disks_after.split())
+            logging.debug('Updated disk list: %s', disks_after)
+
+            new_disks = disks_after-disks_before
+            volume = self.conn.get_volume_by_id(volume_id)
+            attachment = self._get_attachment(volume, self._converter())
+            if len(new_disks) == 1 and attachment.device in new_disks:
+                logging.debug('Successfully attached new disk %s, and '
+                    'source conversion host path agrees with OpenStack.',
+                    attachment.device)
+            else:
+                raise RuntimeError('Got unexpected disk list after attaching '
+                    'volume. Failing migration procedure to avoid assigning '
+                    'destination volumes incorrectly.')
 
     def _export_volumes_from_converter(self):
         """
@@ -499,7 +529,7 @@ class OpenStackSourceHost(_BaseSourceHost):
                 return True
         return False
 
-    @_use_lock(ATTACH_LOCK_FILE)
+    @_use_lock(ATTACH_LOCK_FILE_SOURCE)
     def _detach_volumes_from_converter(self):
         """ Detach volumes from conversion host. """
         converter = self._converter()
@@ -566,6 +596,7 @@ class OpenStackSourceHost(_BaseSourceHost):
                 size=volume.size, wait=True, timeout=DEFAULT_TIMEOUT)
             self.volume_map[path] = mapping._replace(dest_id=new_volume.id)
 
+    @_use_lock(ATTACH_LOCK_FILE_DESTINATION)
     def _attach_destination_volumes(self):
         """
         Volume mapping step 5: attach the new destination volumes to the
@@ -575,11 +606,37 @@ class OpenStackSourceHost(_BaseSourceHost):
         for path, mapping in sorted(self.volume_map.items()):
             volume_id = mapping.dest_id
             volume = self.dest_conn.get_volume_by_id(volume_id)
+            logging.info('Attaching %s to dest conversion host...', volume_id)
+
+            disks_before = self._destination_out(['lsblk', '--noheadings',
+                '--list', '--paths', '--nodeps', '--output NAME'])
+            disks_before = set(disks_before.split())
+            logging.debug('Initial disk list: %s', disks_before)
+
             self.dest_conn.attach_volume(volume=volume, wait=True,
                 server=self._destination(), timeout=DEFAULT_TIMEOUT)
             logging.info('Waiting for volume to appear in destination wrapper')
             self._wait_for_volume_dev_path(self.dest_conn, volume,
                 self._destination(), DEFAULT_TIMEOUT)
+
+            disks_after = self._destination_out(['lsblk', '--noheadings',
+                '--list', '--paths', '--nodeps', '--output NAME'])
+            disks_after = set(disks_after.split())
+            logging.debug('Updated disk list: %s', disks_after)
+
+            new_disks = disks_after-disks_before
+            volume = self.dest_conn.get_volume_by_id(volume_id)
+            attachment = self._get_attachment(volume, self._destination())
+            if len(new_disks) == 1 and attachment.device in new_disks:
+                logging.debug('Successfully attached new disk %s, and '
+                    'destination conversion host path agrees with OpenStack.',
+                    attachment.device)
+            else:
+                raise RuntimeError('Got unexpected disk list after attaching '
+                    'volume to destination conversion host instance. Failing '
+                    'migration procedure to avoid assigning destination '
+                    'volumes incorrectly.')
+
             volume = self.dest_conn.get_volume_by_id(volume_id)
             dev_path = self._get_attachment(volume, self._destination()).device
             self.volume_map[path] = mapping._replace(dest_dev=dev_path)
@@ -632,6 +689,7 @@ class OpenStackSourceHost(_BaseSourceHost):
                     os.remove(overlay)
                 _log_convert(mapping.url, 'raw')
 
+    @_use_lock(ATTACH_LOCK_FILE_DESTINATION)
     def _detach_destination_volumes(self):
         """ Disconnect new volumes from destination conversion host. """
         logging.info('Detaching volumes from destination wrapper.')
