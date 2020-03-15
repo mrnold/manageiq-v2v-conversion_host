@@ -679,8 +679,16 @@ class OpenStackSourceHost(_BaseSourceHost):
                 logging.info('Overlay size: %s', str(os.path.getsize(overlay)))
 
                 cmd = ['virt-sparsify', '--in-place', overlay]
-                out = subprocess.check_output(cmd, env=environment)
-                logging.info('Sparsify output: %s', out)
+                with open(STATE.wrapper_log, 'a') as log_fd:
+                    img_sub = subprocess.Popen(cmd,
+                        stdout=log_fd,
+                        stderr=subprocess.STDOUT,
+                        stdin=subprocess.DEVNULL,
+                        env=environment)
+                    returncode = img_sub.wait()
+                    logging.info('Sparsify return code: %d', returncode)
+                    if returncode != 0:
+                        raise RuntimeError('Failed to convert volume!')
 
                 _log_convert(overlay, 'qcow2')
             except Exception as error:
