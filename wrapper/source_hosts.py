@@ -121,6 +121,12 @@ class OpenStackSourceHost(_BaseSourceHost):
         # Temporary directory for logs on source conversion host
         self.tmpdir = None
 
+        # If there is a specific list of disks to transfer, remember them so
+        # only those disks get transferred.
+        self.source_disks = None
+        if 'source_disks' in data:
+            self.source_disks = data['source_disks']
+
     def prepare_exports(self):
         """ Attach the source VM's volumes to the source conversion host. """
         self._test_ssh_connection()
@@ -266,6 +272,9 @@ class OpenStackSourceHost(_BaseSourceHost):
         for server_volume in sourcevm.volumes:
             volume = self.conn.get_volume_by_id(server_volume['id'])
             logging.info('Inspecting volume: %s', volume.id)
+            if self.source_disks and volume.id not in self.source_disks:
+                logging.info('Volume is not in specified disk list, ignoring.')
+                continue
             dev_path = self._get_attachment(volume, sourcevm).device
             self.volume_map[dev_path] = VolumeMapping(source_dev=None,
                 source_id=volume.id, dest_dev=None, dest_id=None, snap_id=None,
@@ -313,7 +322,8 @@ class OpenStackSourceHost(_BaseSourceHost):
                     break
                 time.sleep(1)
             else:
-                raise('Could not create new image of image-based instance!')
+                raise RuntimeError('Could not create new image of image-based '
+                    'instance!')
             volume = self.conn.create_volume(image=image.id, bootable=True,
                 wait=True, timeout=DEFAULT_TIMEOUT, size=image.min_disk,
                 name=image.name)
@@ -322,7 +332,7 @@ class OpenStackSourceHost(_BaseSourceHost):
                 image_id=image.id, name=volume.name, size=volume.size,
                 url=None)
         else:
-            raise('No known boot device found for this instance!')
+            raise RuntimeError('No known boot device found for this instance!')
 
         for path, mapping in self.volume_map.items():
             if path == '/dev/vda':
@@ -552,26 +562,25 @@ class OpenStackSourceHost(_BaseSourceHost):
         for path, mapping in self.volume_map.items():
             volume = self.conn.get_volume_by_id(mapping.source_id)
             logging.info('Inspecting volume %s', volume.id)
-            attachment = self._get_attachment(volume, converter)
-            if attachment.device == "/dev/vda":
-                logging.info('This is the root volume for this VM')
+            if mapping.source_dev is None:
+                logging.info('Volume is not attached to conversion host, '
+                    'skipping detach.')
                 continue
+            self.conn.detach_volume(server=converter, wait=True,
+                timeout=DEFAULT_TIMEOUT, volume=volume)
+            for second in range(DEFAULT_TIMEOUT):
+                converter = self._converter()
+                volume = self.conn.get_volume_by_id(mapping.source_id)
+                if not self._volume_still_attached(volume, converter):
+                    break
+                time.sleep(1)
             else:
-                logging.info('This volume is a data disk for this VM')
-                self.conn.detach_volume(server=converter, wait=True,
-                    timeout=DEFAULT_TIMEOUT, volume=volume)
-                for second in range(DEFAULT_TIMEOUT):
-                    converter = self._converter()
-                    volume = self.conn.get_volume_by_id(mapping.source_id)
-                    if not self._volume_still_attached(volume, converter):
-                        break
-                    time.sleep(1)
-                else:
-                    raise RuntimeError('Timed out waiting to detach volumes '
-                        'from source conversion host!')
+                raise RuntimeError('Timed out waiting to detach volumes from '
+                    'source conversion host!')
 
     def _attach_data_volumes_to_source(self):
         """ Clean up the copy of the root volume and reattach data volumes. """
+        logging.info('Re-attaching volumes to source VM...')
         for path, mapping in sorted(self.volume_map.items()):
             if path == '/dev/vda':
                 # Delete the temporary copy of the source root disk
@@ -592,11 +601,18 @@ class OpenStackSourceHost(_BaseSourceHost):
                         wait=True, name_or_id=mapping.image_id)
             else:
                 # Attach data volumes back to source VM
-                logging.info('Re-attaching volumes to source VM...')
                 volume = self.conn.get_volume_by_id(mapping.source_id)
-                logging.info('Attaching %s back to source VM...', volume.id)
-                self.conn.attach_volume(volume=volume, wait=True,
-                    server=self._source_vm(), timeout=DEFAULT_TIMEOUT)
+                sourcevm = self._source_vm()
+                try:
+                    attachment = self._get_attachment(volume, sourcevm)
+                except RuntimeError:
+                    logging.info('Attaching %s back to source VM', volume.id)
+                    self.conn.attach_volume(volume=volume, wait=True,
+                        server=sourcevm, timeout=DEFAULT_TIMEOUT)
+                else:
+                    logging.info('Volume %s is already attached to source VM',
+                        volume.id)
+                    continue
 
     def _create_destination_volumes(self): 
         """
@@ -724,9 +740,13 @@ class OpenStackSourceHost(_BaseSourceHost):
                 server=self._destination(), timeout=DEFAULT_TIMEOUT)
 
     def get_disk_ids(self):
-        """ Return a list of disks as expected by STATE.internal's disk_ids """
+        """
+        Return a list of disks as expected by STATE.internal's disk_ids. Only
+        return disks that are actually attached to the destination conversion
+        host, or handle_cleanup will fail.
+        """
         disk_ids = {}
         for path, mapping in self.volume_map.items():
-            volume_id = mapping.dest_id
-            disk_ids[path] = volume_id
+            if mapping.dest_id is not None:
+                disk_ids[path] = mapping.dest_id
         return disk_ids
