@@ -454,24 +454,14 @@ class OpenStackSourceHost(_BaseSourceHost):
         """
         SSH to source conversion host and start an NBD export. Start the UCI
         with /dev/vdb, /dev/vdc, etc. attached, then pass JSON input to request
-        nbdkit exports from the V2V wrapper. Find free ports up front so they
-        can be passed to the container. Volume mapping step 4: fill in the URL
-        to the volume's matching NBD export.
+        nbdkit exports from the V2V wrapper. Volume mapping step 4: fill in the
+        URL to the volume's matching NBD export.
         """
         logging.info('Exporting volumes from source conversion host...')
 
         # Create a temporary directory on source conversion host
         self.tmpdir = self._converter_out(['mktemp', '-d', '-t', 'v2v-XXXXXX'])
         logging.info('Source conversion host temp dir: %s', self.tmpdir)
-
-
-        # TODO: remove this, temporary update mechanism for development only
-        self._converter_val(['mkdir', '-p', self.tmpdir+'/update'])
-        self._converter_val(['cp', '/v2v/update/v2v-conversion-host.tar.gz',
-            self.tmpdir+'/update/v2v-conversion-host.tar.gz'])
-        self._converter_val(['cp', '/v2v2/update/v2v-conversion-host.tar.gz',
-            self.tmpdir+'/update/v2v-conversion-host.tar.gz'])
-
 
         # Choose NBD ports for inside the container
         port = 10809
@@ -491,6 +481,8 @@ class OpenStackSourceHost(_BaseSourceHost):
             port += 1
 
         # Copy the port map as input to the source conversion host wrapper
+        self._converter_val(['mkdir', '-p', self.tmpdir+'/lib'])
+        self._converter_val(['mkdir', '-p', self.tmpdir+'/log'])
         self._converter_val(['mkdir', '-p', self.tmpdir+'/input'])
         ports = json.dumps({'nbd_export_only': port_map})
         nbd_conversion = '/tmp/nbd_conversion.json'
@@ -499,15 +491,19 @@ class OpenStackSourceHost(_BaseSourceHost):
         self._converter_scp(nbd_conversion,
             self.tmpdir+'/input/conversion.json')
 
-        # Run UCI on source conversion host. Create a temporary directory
-        # to use as the UCI's /data directory so more than one can run at a
-        # time. TODO: change container name to the real thing
+        # Run UCI on source conversion host. Create a temporary directory to
+        # use as the UCI's /data directory so more than one can run at a time.
         ssh_args = ['sudo', 'podman', 'run', '--detach']
-        ssh_args.extend(['-v', self.tmpdir+':/data:z'])
+        ssh_args.extend(['--volume', '/var/tmp:/var/tmp:z'])
+        ssh_args.extend(['--volume', '/var/lock:/var/lock:z'])
+        ssh_args.extend(['--volume', self.tmpdir+':/data:z'])
+        ssh_args.extend(['--volume', self.tmpdir+'/lib:/var/lib/uci:z'])
+        ssh_args.extend(['--volume', self.tmpdir+'/log:/var/log/uci:z'])
+        ssh_args.extend(['--volume',
+            '/opt/vmware-vix-disklib-distrib:/opt/vmware-vix-disklib-distrib'])
         ssh_args.extend(nbd_ports)
         ssh_args.extend(device_list)
-        ssh_args.extend(['localhost/v2v-updater'])
-        ssh_args.extend(['/usr/local/bin/entrypoint'])
+        ssh_args.extend(['v2v-conversion-host'])
         self.uci_id = self._converter_out(ssh_args)
         logging.debug('Source UCI container ID: %s', self.uci_id)
 
@@ -559,14 +555,12 @@ class OpenStackSourceHost(_BaseSourceHost):
     def _converter_close_exports(self):
         """
         SSH to source conversion host and close the NBD export. Currently this
-        amounts to just stopping the container. (TODO) Also release the ports
-        this process was using.
+        pretty much amounts to just stopping the container.
         """
         logging.info('Stopping export from source conversion host...')
         try:
             out = self._converter_out(['sudo', 'podman', 'stop', self.uci_id])
             logging.info('Closed NBD export with result: %s', out)
-            self.forwarding_process.terminate()
 
             # Copy logs from temporary directory locally, and clean up source
             if self.tmpdir:
@@ -574,6 +568,8 @@ class OpenStackSourceHost(_BaseSourceHost):
                 self._converter_scp_from(self.tmpdir+'/*', SOURCE_LOGS_DIR,
                     recursive=True)
                 self._converter_out(['rm', '-rf', self.tmpdir])
+
+            self.forwarding_process.terminate()
         except Exception as error:
             pass
 
