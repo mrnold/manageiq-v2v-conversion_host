@@ -696,7 +696,7 @@ class OpenStackSourceHost(_BaseSourceHost):
             logging.info('Converting source VM\'s %s: %s', path, str(mapping))
             overlay = '/tmp/'+os.path.basename(mapping.dest_dev)+'.qcow2'
 
-            def _log_convert(source_disk, source_format):
+            def _log_convert(source_disk, source_format, mapping):
                 """ Write qemu-img convert progress to the wrapper log. """
                 logging.info('Copying volume data...')
                 cmd = ['qemu-img', 'convert', '-p', '-f', source_format, '-O',
@@ -726,9 +726,9 @@ class OpenStackSourceHost(_BaseSourceHost):
                 logging.info('Conversion return code: %d', img_sub.returncode)
                 if img_sub.returncode != 0:
                     raise RuntimeError('Failed to convert volume!')
-                else:  # In case qemu-img returned before readline got to 100%
-                    mapping.state.progress = 100.0
-                    STATE.write()
+                # Just in case qemu-img returned before readline got to 100%
+                mapping.state.progress = 100.0
+                STATE.write()
 
             try:
                 logging.info('Attempting initial sparsify...')
@@ -753,12 +753,12 @@ class OpenStackSourceHost(_BaseSourceHost):
                     if returncode != 0:
                         raise RuntimeError('Failed to convert volume!')
 
-                _log_convert(overlay, 'qcow2')
+                _log_convert(overlay, 'qcow2', mapping)
             except Exception:
                 logging.info('Sparsify failed, converting whole device...')
                 if os.path.isfile(overlay):
                     os.remove(overlay)
-                _log_convert(mapping.url, 'raw')
+                _log_convert(mapping.url, 'raw', mapping)
 
     @_use_lock(ATTACH_LOCK_FILE_DESTINATION)
     def _detach_destination_volumes(self):
