@@ -29,8 +29,8 @@ from .state import STATE, Disk
 from .pre_copy import PreCopy
 
 
-NBD_READY_SENTINEL = 'nbdready' # Created when nbdkit exports are ready
-DEFAULT_TIMEOUT = 600           # Maximum wait for openstacksdk operations
+NBD_READY_SENTINEL = 'nbdready'  # Created when nbdkit exports are ready
+DEFAULT_TIMEOUT = 600            # Maximum wait for openstacksdk operations
 
 # Lock to serialize volume attachments. This helps prevent device path
 # mismatches between the OpenStack SDK and /dev in the VM.
@@ -46,6 +46,7 @@ def detect_source_host(data, agent_sock):
     if 'osp_source_environment' in data:
         return OpenStackSourceHost(data, agent_sock)
     return None
+
 
 class _BaseSourceHost(object):
     """ Interface for source hosts. """
@@ -69,17 +70,19 @@ class _BaseSourceHost(object):
 
 
 VolumeMapping = namedtuple('VolumeMapping',
-    ['source_dev', # Device path (like /dev/vdb) on source conversion host
-     'source_id', # Volume ID on source conversion host
-     'dest_dev', # Device path on destination conversion host
-     'dest_id', # Volume ID on destination conversion host
-     'snap_id', # Root volumes need snapshot+new volume, so record snapshot ID
-     'image_id', # Direct-from-image VMs create this temporary snapshot image
-     'name', # Save volume name so root volumes don't look weird on destination
-     'size', # Volume size reported by OpenStack, in GB
-     'url', # Final NBD export address from source conversion host
-     'state' # STATE.Disk object for tracking progress
-    ])
+        ['source_dev',  # Device path (like /dev/vdb) on source conversion host
+         'source_id',   # Volume ID on source conversion host
+         'dest_dev',    # Device path on destination conversion host
+         'dest_id',     # Volume ID on destination conversion host
+         'snap_id',     # Root volumes need snapshot+new volume
+         'image_id',    # Direct-from-image VMs create temporary snapshot image
+         'name',        # Save volume name to set on destination
+         'size',        # Volume size reported by OpenStack, in GB
+         'url',         # Final NBD export address from source conversion host
+         'state'        # STATE.Disk object for tracking progress
+        ])
+
+
 class OpenStackSourceHost(_BaseSourceHost):
     """ Export volumes from an OpenStack instance. """
 
