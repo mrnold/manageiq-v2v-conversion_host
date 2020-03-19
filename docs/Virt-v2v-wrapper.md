@@ -115,8 +115,8 @@ assuming everything else is already configured.
 * The conversion host instance must have an IPv4 address that is accessible
 from the destination OpenStack cloud.
 * The conversion host instance must have SSH enabled in the security rules.
-* The conversion host instance must be configured to use the same SSH key as
-the destination conversion host instance (see below).
+* The conversion host instance must be configured for key-based SSH access from
+the destination conversion host instance (see input arguments below).
 * The source VM must be shut down. If it is not already shut down, the wrapper
 will shut it down forcibly before proceeding with the transfer.
 * If the source VM is launched from a volume, there must be space in the
@@ -132,8 +132,9 @@ VM's flavor specification).
 
 * A conversion host instance must be launched from the UCI, in the same way
 virt-v2v requires.
-* The destination conversion host must be configured to use the same SSH key as
-the source conversion host instance on the source OpenStack cloud.
+* The destination conversion host must be configured to be able to log in to
+the source conversion host instance with an SSH key. The key can be specified
+in the `ssh_key` input argument, or stored in /home/cloud-user/.ssh.
 
 ### OpenStack-specific inputs
 
@@ -209,6 +210,17 @@ Example:
 		"ssh_key": "-----BEGIN OPENSSH PRIVATE KEY-----\n...\n...\n-----END OPENSSH PRIVATE KEY-----\n"
 	}
 
+OpenStack migrations assume the wrapper is running in a UCI container on both
+source and destination clouds. The wrapper serializes volume attachments by
+writing lock files to /var/lock, so this directory must be exposed to all
+destination instances if there are multiple migrations running concurrently. An
+example invocation from the destination conversion host looks like this:
+
+	sudo podman run --privileged --volume /dev:/dev --volume /etc/pki/ca-trust:/etc/pki/ca-trust --volume /var/tmp:/var/tmp --volume /v2v:/data --volume /v2v/lib:/var/lib/uci --volume /v2v/log:/var/log/uci --volume /opt/vmware-vix-disklib-distrib:/opt/vmware-vix-disklib-distrib --volume /var/lock:/var/lock v2v-conversion-host
+
+This assumes a working directory named /v2v. The conversion JSON should be
+placed in /v2v/input/conversion.json, and logs from the source conversion host
+should be copied to `/v2v/source_logs` at the end of the migration.
 
 ## Output configuration
 
