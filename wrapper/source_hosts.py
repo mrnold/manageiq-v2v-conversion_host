@@ -14,6 +14,7 @@ because those aren't supposed to use virt-v2v - in this case, this module will
 transfer the data itself instead of calling the main wrapper function.
 """
 
+import errno
 import fcntl
 import json
 import logging
@@ -169,7 +170,7 @@ class OpenStackSourceHost(_BaseSourceHost):
         """ Provide default set of SSH options. """
         return [
             '-o', 'BatchMode=yes',
-            '-o', 'StrictHostKeyChecking=no', 
+            '-o', 'StrictHostKeyChecking=no',
             '-o', 'ConnectTimeout=10',
         ]
 
@@ -338,9 +339,7 @@ class OpenStackSourceHost(_BaseSourceHost):
             raise RuntimeError('No known boot device found for this instance!')
 
         for path, mapping in self.volume_map.items():
-            if path == '/dev/vda':
-                continue
-            else: # Detach non-root volumes
+            if path != '/dev/vda': # Detach non-root volumes
                 volume_id = mapping.source_id
                 volume = self.conn.get_volume_by_id(volume_id)
                 logging.info('Detaching %s from %s', volume.id, sourcevm.id)
@@ -406,7 +405,7 @@ class OpenStackSourceHost(_BaseSourceHost):
                         attachment.device, name, dev_path)
             else:
                 raise RuntimeError('Got unexpected disk list after attaching '
-                    'volume to %s conversion host instance. Failing migration '
+                    'volume to {} conversion host instance. Failing migration '
                     'procedure to avoid assigning volumes incorrectly. New '
                     'disks(s) inside VM: {}, disk provided by OpenStack: '
                     '{}'.format(name, new_disks, dev_path))
@@ -640,7 +639,7 @@ class OpenStackSourceHost(_BaseSourceHost):
                         volume.id)
                     continue
 
-    def _create_destination_volumes(self): 
+    def _create_destination_volumes(self):
         """
         Volume mapping step 5: create new volumes on the destination OpenStack,
         and fill in dest_id with the new volumes.
