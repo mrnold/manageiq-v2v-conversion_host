@@ -361,9 +361,7 @@ class OpenStackSourceHost(_BaseSourceHost):
             time.sleep(1)
         raise RuntimeError('Timed out waiting for volume device path!')
 
-    def _attach_volumes(
-            self, conn, host_func, name, ssh_func, update_func,
-            volume_id_func):
+    def _attach_volumes(self, conn, name, funcs):
         """
         Attach all volumes in the volume map to the specified conversion host.
         Check the list of disks before and after attaching to be absolutely
@@ -372,6 +370,7 @@ class OpenStackSourceHost(_BaseSourceHost):
         _attach_volumes_to_converter looked almost identical.
         """
         logging.info('Attaching volumes to %s wrapper', name)
+        host_func, ssh_func, update_func, volume_id_func = funcs
         for path, mapping in sorted(self.volume_map.items()):
             volume_id = volume_id_func(mapping)
             volume = conn.get_volume_by_id(volume_id)
@@ -419,6 +418,7 @@ class OpenStackSourceHost(_BaseSourceHost):
                                                           dev_path))
             self.volume_map[path] = update_func(mapping, dev_path)
 
+    @staticmethod
     def _use_lock(lock_file):
         """ Boilerplate for functions that need to take a lock. """
         def _decorate_lock(function):
@@ -455,8 +455,10 @@ class OpenStackSourceHost(_BaseSourceHost):
 
         def volume_id(volume_mapping):
             return volume_mapping.source_id
-        self._attach_volumes(self.conn, self._converter, 'source',
-                             self._converter_out, update_source, volume_id)
+
+        self._attach_volumes(self.conn, 'source', (self._converter,
+                                                   self._converter_out,
+                                                   update_source, volume_id))
 
     def _export_volumes_from_converter(self):
         """
@@ -678,8 +680,10 @@ class OpenStackSourceHost(_BaseSourceHost):
 
         def volume_id(volume_mapping):
             return volume_mapping.dest_id
-        self._attach_volumes(self.dest_conn, self._destination, 'destination',
-                             self._destination_out, update_dest, volume_id)
+
+        self._attach_volumes(self.dest_conn, 'destination',
+                             (self._destination, self._destination_out,
+                              update_dest, volume_id))
 
     def _convert_destination_volumes(self):
         """
