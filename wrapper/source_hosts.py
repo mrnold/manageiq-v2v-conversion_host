@@ -48,6 +48,30 @@ def detect_source_host(data, agent_sock):
     return None
 
 
+def _use_lock(lock_file):
+    """ Boilerplate for functions that need to take a lock. """
+    def _decorate_lock(function):
+        def wait_for_lock(self):
+            with open(lock_file, 'wb+') as lock:
+                for second in range(DEFAULT_TIMEOUT):
+                    try:
+                        logging.info('Waiting for lock %s...', lock_file)
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except OSError:
+                        logging.info('Another conversion has the lock.')
+                        time.sleep(1)
+                else:
+                    raise RuntimeError(
+                        'Unable to acquire lock {}!'.format(lock_file))
+                try:
+                    function(self)
+                finally:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+        return wait_for_lock
+    return _decorate_lock
+
+
 class _BaseSourceHost(object):
     """ Interface for source hosts. """
 
@@ -417,30 +441,6 @@ class OpenStackSourceHost(_BaseSourceHost):
                                    'OpenStack: {}'.format(name, new_disks,
                                                           dev_path))
             self.volume_map[path] = update_func(mapping, dev_path)
-
-    @staticmethod
-    def _use_lock(lock_file):
-        """ Boilerplate for functions that need to take a lock. """
-        def _decorate_lock(function):
-            def wait_for_lock(self):
-                with open(lock_file, 'wb+') as lock:
-                    for second in range(DEFAULT_TIMEOUT):
-                        try:
-                            logging.info('Waiting for lock %s...', lock_file)
-                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                            break
-                        except OSError:
-                            logging.info('Another conversion has the lock.')
-                            time.sleep(1)
-                    else:
-                        raise RuntimeError(
-                            'Unable to acquire lock {}!'.format(lock_file))
-                    try:
-                        function(self)
-                    finally:
-                        fcntl.flock(lock, fcntl.LOCK_UN)
-            return wait_for_lock
-        return _decorate_lock
 
     # Lock this part to have a better chance of the OpenStack device path
     # matching the device path seen inside the conversion host.
