@@ -245,7 +245,7 @@ class OpenStackSourceHost(_BaseSourceHost):
         command = ['scp']
         command.extend(self._ssh_args())
         command.extend([source, 'cloud-user@'+address+':'+dest])
-        return subprocess.check_output(command, env=environment)
+        return subprocess.call(command, env=environment)
 
     def _converter_scp_from(self, source, dest, recursive=False):
         """ Copy a file from the source conversion host. """
@@ -257,7 +257,7 @@ class OpenStackSourceHost(_BaseSourceHost):
         if recursive:
             command.extend(['-r'])
         command.extend(['cloud-user@'+address+':'+source, dest])
-        return subprocess.check_output(command, env=environment)
+        return subprocess.call(command, env=environment)
 
     def _test_ssh_connection(self):
         """ Quick SSH connectivity check for source conversion host. """
