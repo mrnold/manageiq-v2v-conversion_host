@@ -578,7 +578,7 @@ class OpenStackSourceHost(_BaseSourceHost):
                 os.mkdir(SOURCE_LOGS_DIR)
                 self._converter_scp_from(self.tmpdir+'/*', SOURCE_LOGS_DIR,
                                          recursive=True)
-                self._converter_out(['rm', '-rf', self.tmpdir])
+                self._converter_out(['sudo', 'rm', '-rf', self.tmpdir])
 
             self.forwarding_process.terminate()
         except Exception as error:
