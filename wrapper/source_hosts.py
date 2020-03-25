@@ -152,7 +152,7 @@ class OpenStackSourceHost(_BaseSourceHost):
     def prepare_exports(self):
         """ Attach the source VM's volumes to the source conversion host. """
         self._test_ssh_connection()
-        self._shutdown_source_vm()
+        self._test_source_vm_shutdown()
         self._get_root_and_data_volumes()
         self._detach_data_volumes_from_source()
         self._attach_volumes_to_converter()
@@ -265,14 +265,13 @@ class OpenStackSourceHost(_BaseSourceHost):
         if out != 'connected':
             raise RuntimeError('Unable to SSH to source conversion host!')
 
-    def _shutdown_source_vm(self):
-        """ Shut down the migration source VM before moving its volumes. """
+    def _test_source_vm_shutdown(self):
+        """ Make sure the source VM is shutdown, and fail if it isn't. """
         server = self.conn.compute.get_server(self._source_vm().id)
         if server.status != 'SHUTOFF':
-            self.conn.compute.stop_server(server=server)
-            logging.info('Waiting for source VM to stop...')
-            self.conn.compute.wait_for_server(server, 'SHUTOFF',
-                                              wait=DEFAULT_TIMEOUT)
+            message = 'Source VM is not shut down!'
+            error(message)
+            raise RuntimeError(message)
 
     def _get_attachment(self, volume, vm):
         """

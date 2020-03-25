@@ -117,8 +117,7 @@ from the destination OpenStack cloud.
 * The conversion host instance must have SSH enabled in the security rules.
 * The conversion host instance must be configured for key-based SSH access from
 the destination conversion host instance (see input arguments below).
-* The source VM must be shut down. If it is not already shut down, the wrapper
-will shut it down forcibly before proceeding with the transfer.
+* The source VM must be shut down.
 * If the source VM is launched from a volume, there must be space in the
 project's quota for one snapshot of that volume, and for one new volume to be
 created from that snapshot.
