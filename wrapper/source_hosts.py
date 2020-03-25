@@ -24,6 +24,7 @@ import subprocess
 import time
 from collections import namedtuple
 
+from .common import VDDK_LIBDIR
 from .hosts import OpenstackHost
 from .state import STATE, Disk
 from .pre_copy import PreCopy
@@ -503,9 +504,7 @@ class OpenStackSourceHost(_BaseSourceHost):
         ssh_args.extend(['--volume', self.tmpdir+':/data:z'])
         ssh_args.extend(['--volume', self.tmpdir+'/lib:/var/lib/uci:z'])
         ssh_args.extend(['--volume', self.tmpdir+'/log:/var/log/uci:z'])
-        ssh_args.extend(['--volume',
-                         '/opt/vmware-vix-disklib-distrib:'
-                         '/opt/vmware-vix-disklib-distrib'])
+        ssh_args.extend(['--volume', '{0}:{0}'.format(VDDK_LIBDIR)])
         ssh_args.extend(nbd_ports)
         ssh_args.extend(device_list)
         ssh_args.extend(['v2v-conversion-host'])
