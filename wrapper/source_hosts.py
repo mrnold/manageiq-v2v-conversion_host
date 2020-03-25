@@ -111,27 +111,23 @@ class OpenStackSourceHost(_BaseSourceHost):
     """ Export volumes from an OpenStack instance. """
 
     def __init__(self, data, agent_sock):
-        # Create a connection to the source cloud
-        osp_arg_list = ['auth_url', 'username', 'password',
-                        'project_name', 'project_domain_name',
-                        'user_domain_name', 'verify']
-        osp_env = data['osp_source_environment']
-        osp_args = {arg: osp_env[arg] for arg in osp_arg_list}
-        self.source_converter = osp_env['conversion_vm_id']
-        self.source_instance = osp_env['vm_id']
-        self.conn = openstack.connect(**osp_args)
-
-        # Create a connection to the destination cloud
         osp_arg_list = ['os-auth_url', 'os-username', 'os-password',
                         'os-project_name', 'os-project_domain_name',
                         'os-user_domain_name']
+
+        # Create a connection to the source cloud
+        osp_env = data['osp_source_environment']
+        osp_args = {arg[3:].lower(): osp_env[arg] for arg in osp_arg_list}
+        osp_args['verify'] = data.get('insecure_connection', False)
+        self.source_converter = data['osp_source_conversion_vm_id']
+        self.source_instance = data['osp_source_vm_id']
+        self.conn = openstack.connect(**osp_args)
+
+        # Create a connection to the destination cloud
         osp_env = data['osp_environment']
-        osp_args = {arg[3:]: osp_env[arg] for arg in osp_arg_list}  # Trim os-
+        osp_args = {arg[3:].lower(): osp_env[arg] for arg in osp_arg_list}
+        osp_args['verify'] = data.get('insecure_connection', False)
         self.dest_converter = data['osp_server_id']
-        if 'insecure_connection' in data:
-            osp_args['verify'] = not data['insecure_connection']
-        else:
-            osp_args['verify'] = False
         self.dest_conn = openstack.connect(**osp_args)
 
         self.agent_sock = agent_sock
