@@ -106,6 +106,16 @@ The migration works by attaching volumes to the source and destination
 conversion hosts and transferring data from inside the conversion hosts over
 SSH.
 
+Currently, both source and destination conversion hosts expect to run inside a
+Universal Conversion Image (UCI) provided by this project:
+https://github.com/ManageIQ/manageiq-v2v-conversion_host-build
+
+Specifically, the appliance version of the UCI should be uploaded to source and
+destination OpenStack clouds as an image, and conversion host instances should
+be created from those images. Log in as `cloud-user` and check the output of
+`sudo podman images`. There should be a pre-configured container named
+`v2v-conversion-host` that contains the actual V2V-wrapper tooling.
+
 ### Source OpenStack cloud
 
 * A conversion host instance must be launched from the UCI, in the same project
