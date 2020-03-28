@@ -119,7 +119,7 @@ class OpenStackSourceHost(_BaseSourceHost):
         # Create a connection to the source cloud
         osp_env = data['osp_source_environment']
         osp_args = {arg[3:].lower(): osp_env[arg] for arg in osp_arg_list}
-        osp_args['verify'] = data.get('insecure_connection', False)
+        osp_args['verify'] = not data.get('insecure_connection', False)
         self.source_converter = data['osp_source_conversion_vm_id']
         self.source_instance = data['osp_source_vm_id']
         self.conn = openstack.connect(**osp_args)
@@ -127,7 +127,7 @@ class OpenStackSourceHost(_BaseSourceHost):
         # Create a connection to the destination cloud
         osp_env = data['osp_environment']
         osp_args = {arg[3:].lower(): osp_env[arg] for arg in osp_arg_list}
-        osp_args['verify'] = data.get('insecure_connection', False)
+        osp_args['verify'] = not data.get('insecure_connection', False)
         self.dest_converter = data['osp_server_id']
         self.dest_conn = openstack.connect(**osp_args)
 
