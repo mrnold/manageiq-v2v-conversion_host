@@ -123,6 +123,9 @@ class OpenStackSourceHost(_BaseSourceHost):
         self.source_converter = data['osp_source_conversion_vm_id']
         self.source_instance = data['osp_source_vm_id']
         self.conn = openstack.connect(**osp_args)
+        if self._converter() is None:
+            raise RuntimeError('Cannot find source instance {}'.format(
+                               self.source_converter))
 
         # Create a connection to the destination cloud
         osp_env = data['osp_environment']
@@ -130,6 +133,9 @@ class OpenStackSourceHost(_BaseSourceHost):
         osp_args['verify'] = not data.get('insecure_connection', False)
         self.dest_converter = data['osp_server_id']
         self.dest_conn = openstack.connect(**osp_args)
+        if self._destination() is None:
+            raise RuntimeError('Cannot find destination instance {}'.format(
+                               self.dest_converter))
 
         self.agent_sock = agent_sock
         openstack.enable_logging()  # Make openstacksdk logging quieter
