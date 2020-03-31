@@ -486,7 +486,7 @@ class OpenStackSourceHost(_BaseSourceHost):
             dev_path = mapping.source_dev
             uci_dev_path = mapping.source_dev+'-v2v'
             logging.info('Exporting %s from volume %s', dev_path, volume_id)
-            nbd_ports.extend(['-p', '{0}'.format(port)])
+            nbd_ports.extend(['-p', '127.0.0.1::{0}'.format(port)])
             device_list.extend(['--device', dev_path+':'+uci_dev_path])
             reverse_port_map[port] = path
             port_map[uci_dev_path] = port
@@ -525,7 +525,11 @@ class OpenStackSourceHost(_BaseSourceHost):
             logging.debug('Forwarding port from podman: %s', line)
             internal_port, _, _ = line.partition('/')
             _, _, external_port = line.rpartition(':')
-            port = int(internal_port)
+            try:
+                port = int(internal_port)
+            except ValueError:
+                raise RuntimeError('Could not get port number from podman on '
+                                   'source conversion host! Line was '+line)
             path = reverse_port_map[port]
             # The internal_port in the source conversion container is forwarded
             # to external_port on the source conversion host, and then we need
