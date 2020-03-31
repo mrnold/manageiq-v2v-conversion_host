@@ -24,7 +24,7 @@ import subprocess
 import time
 from collections import namedtuple
 
-from .common import VDDK_LIBDIR
+from .common import error, VDDK_LIBDIR
 from .hosts import OpenstackHost
 from .state import STATE, Disk
 from .pre_copy import PreCopy
