@@ -576,17 +576,20 @@ class OpenStackSourceHost(_BaseSourceHost):
         try:
             out = self._converter_out(['sudo', 'podman', 'stop', self.uci_id])
             logging.info('Closed NBD export with result: %s', out)
+        except subprocess.CalledProcessError as error:
+            logging.debug('Error stopping UCI container on source: %s', error)
 
+        try:
             # Copy logs from temporary directory locally, and clean up source
             if self.tmpdir:
-                os.mkdir(SOURCE_LOGS_DIR)
+                os.makedirs(SOURCE_LOGS_DIR, exist_ok=True)
                 self._converter_scp_from(self.tmpdir+'/*', SOURCE_LOGS_DIR,
                                          recursive=True)
                 self._converter_out(['sudo', 'rm', '-rf', self.tmpdir])
+        except subprocess.CalledProcessError as error:
+            logging.debug('Error copying logs from source: %s', error)
 
-            self.forwarding_process.terminate()
-        except Exception as error:
-            logging.debug('Error closing exports: %s', error)
+        self.forwarding_process.terminate()
 
     def _volume_still_attached(self, volume, vm):
         """ Check if a volume is still attached to a VM. """
@@ -758,7 +761,7 @@ class OpenStackSourceHost(_BaseSourceHost):
                         raise RuntimeError('Failed to convert volume!')
 
                 _log_convert(overlay, 'qcow2', mapping)
-            except Exception:
+            except (OSError, subprocess.CalledProcessError) as error:
                 logging.info('Sparsify failed, converting whole device...')
                 if os.path.isfile(overlay):
                     os.remove(overlay)
