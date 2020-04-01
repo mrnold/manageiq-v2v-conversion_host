@@ -18,7 +18,6 @@ import errno
 import fcntl
 import json
 import logging
-import openstack
 import os
 import subprocess
 import time
@@ -133,6 +132,11 @@ class OpenStackSourceHost(_BaseSourceHost):
     """ Export volumes from an OpenStack instance. """
 
     def __init__(self, data, agent_sock):
+        try:
+            import openstack
+        except ImportError:
+            raise RuntimeError('OpenStack SDK is not installed on this '
+                               'conversion host!')
         osp_arg_list = ['os-auth_url', 'os-username', 'os-password',
                         'os-project_name', 'os-project_domain_name',
                         'os-user_domain_name']
@@ -296,9 +300,7 @@ class OpenStackSourceHost(_BaseSourceHost):
         """ Make sure the source VM is shutdown, and fail if it isn't. """
         server = self.conn.compute.get_server(self._source_vm().id)
         if server.status != 'SHUTOFF':
-            message = 'Source VM is not shut down!'
-            error(message)
-            raise RuntimeError(message)
+            raise RuntimeError('Source VM is not shut down!')
 
     def _get_attachment(self, volume, vm):
         """
