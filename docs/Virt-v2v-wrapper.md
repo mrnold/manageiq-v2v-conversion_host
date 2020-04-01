@@ -162,6 +162,10 @@ source OpenStack cloud.
   * `os-project_name`: Name of project containing source conversion host instance
   * `os-project_domain_name`: Domain name of source project
   * `os-verify`: Verify source OpenStack API certificate (true or false)
+* `uci_container`: The ID of the virt-v2v-wrapper container inside the UCI on
+the source conversion host. This is needed so that the destination conversion
+host can run the second copy of the wrapper on the source. This defaults to
+`v2v-conversion-host`, which may not always match different builds of the UCI.
 
 Currently OpenStack source clouds can only be migrated to an OpenStack
 destination, so a full input JSON needs to include the OpenStack input
@@ -195,6 +199,7 @@ Example:
 			"os-project_domain_name": "Default",
 			"os-user_domain_name": "Default",
 		},
+		"uci_container": "v2v-conversion-host-rhel8",
 		"ssh_key": "-----BEGIN OPENSSH PRIVATE KEY-----\n...\n...\n-----END OPENSSH PRIVATE KEY-----\n"
 	}
 

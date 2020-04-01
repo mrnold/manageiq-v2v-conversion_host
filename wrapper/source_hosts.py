@@ -181,6 +181,9 @@ class OpenStackSourceHost(_BaseSourceHost):
         if 'source_disks' in data:
             self.source_disks = data['source_disks']
 
+        # Allow UCI container ID (or name) to be passed in input JSON
+        self.uci_container = data.get('uci_container', 'v2v-conversion-host')
+
     def prepare_exports(self):
         """ Attach the source VM's volumes to the source conversion host. """
         self._test_ssh_connection()
@@ -539,7 +542,7 @@ class OpenStackSourceHost(_BaseSourceHost):
         ssh_args.extend(['--volume', '{0}:{0}'.format(VDDK_LIBDIR)])
         ssh_args.extend(nbd_ports)
         ssh_args.extend(device_list)
-        ssh_args.extend(['v2v-conversion-host'])
+        ssh_args.extend([self.uci_container])
         self.uci_id = self._converter_out(ssh_args)
         logging.debug('Source UCI container ID: %s', self.uci_id)
 
