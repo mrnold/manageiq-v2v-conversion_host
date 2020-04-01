@@ -23,7 +23,7 @@ import subprocess
 import time
 from collections import namedtuple
 
-from .common import error, VDDK_LIBDIR
+from .common import VDDK_LIBDIR
 from .hosts import OpenstackHost
 from .state import STATE, Disk
 from .pre_copy import PreCopy
@@ -47,12 +47,14 @@ def detect_source_host(data, agent_sock):
         return OpenStackSourceHost(data, agent_sock)
     return None
 
+
 def avoid_wrapper(source_host, host):
     """
     Check if this combination of source and destination host should avoid
     running virt-v2v.
     """
     return source_host and source_host.avoid_wrapper(host)
+
 
 def migrate_instance(source_host, host):
     """ Run all the pieces of a source_host migration. """
@@ -605,8 +607,8 @@ class OpenStackSourceHost(_BaseSourceHost):
         try:
             out = self._converter_out(['sudo', 'podman', 'stop', self.uci_id])
             logging.info('Closed NBD export with result: %s', out)
-        except subprocess.CalledProcessError as error:
-            logging.debug('Error stopping UCI container on source: %s', error)
+        except subprocess.CalledProcessError as err:
+            logging.debug('Error stopping UCI container on source: %s', err)
 
         try:
             # Copy logs from temporary directory locally, and clean up source
@@ -615,8 +617,8 @@ class OpenStackSourceHost(_BaseSourceHost):
                 self._converter_scp_from(self.tmpdir+'/*', SOURCE_LOGS_DIR,
                                          recursive=True)
                 self._converter_out(['sudo', 'rm', '-rf', self.tmpdir])
-        except subprocess.CalledProcessError as error:
-            logging.debug('Error copying logs from source: %s', error)
+        except subprocess.CalledProcessError as err:
+            logging.debug('Error copying logs from source: %s', err)
 
         if self.forwarding_process:
             self.forwarding_process.terminate()
@@ -791,7 +793,7 @@ class OpenStackSourceHost(_BaseSourceHost):
                         raise RuntimeError('Failed to convert volume!')
 
                 _log_convert(overlay, 'qcow2', mapping)
-            except (OSError, subprocess.CalledProcessError) as error:
+            except (OSError, subprocess.CalledProcessError):
                 logging.info('Sparsify failed, converting whole device...')
                 if os.path.isfile(overlay):
                     os.remove(overlay)
