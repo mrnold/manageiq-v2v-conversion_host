@@ -48,6 +48,27 @@ def detect_source_host(data, agent_sock):
         return OpenStackSourceHost(data, agent_sock)
     return None
 
+def avoid_wrapper(source_host, host):
+    """
+    Check if this combination of source and destination host should avoid
+    running virt-v2v.
+    """
+    return source_host and source_host.avoid_wrapper(host)
+
+def migrate_instance(source_host, host):
+    """ Run all the pieces of a source_host migration. """
+    if source_host:
+        try:
+            source_host.prepare_exports()
+            source_host.transfer_exports(host)
+            source_host.close_exports()
+        except RuntimeError:
+            logging.error('Got error migrating instance, attempting cleanup.')
+            source_host.close_exports()
+            raise
+    else:
+        logging.info('Ignoring migration request for empty source_host.')
+
 
 def _use_lock(lock_file):
     """ Boilerplate for functions that need to take a lock. """
@@ -147,6 +168,9 @@ class OpenStackSourceHost(_BaseSourceHost):
         # Temporary directory for logs on source conversion host
         self.tmpdir = None
 
+        # SSH tunnel process
+        self.forwarding_process = None
+
         # If there is a specific list of disks to transfer, remember them so
         # only those disks get transferred.
         self.source_disks = None
@@ -164,7 +188,6 @@ class OpenStackSourceHost(_BaseSourceHost):
 
     def close_exports(self):
         """ Put the source VM's volumes back where they were. """
-        self._test_ssh_connection()
         self._converter_close_exports()
         self._detach_volumes_from_converter()
         self._attach_data_volumes_to_source()
@@ -590,7 +613,8 @@ class OpenStackSourceHost(_BaseSourceHost):
         except subprocess.CalledProcessError as error:
             logging.debug('Error copying logs from source: %s', error)
 
-        self.forwarding_process.terminate()
+        if self.forwarding_process:
+            self.forwarding_process.terminate()
 
     def _volume_still_attached(self, volume, vm):
         """ Check if a volume is still attached to a VM. """
