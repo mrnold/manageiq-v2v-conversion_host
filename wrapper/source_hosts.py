@@ -24,9 +24,8 @@ import subprocess
 import time
 from collections import namedtuple
 
-from .hosts import OpenstackHost
-from .state import STATE, Disk
-from .pre_copy import PreCopy
+from .hosts import OSPHost
+from .singleton import State
 
 
 NBD_READY_SENTINEL = 'nbdready'  # Created when nbdkit exports are ready
@@ -126,7 +125,7 @@ VolumeMapping = namedtuple('VolumeMapping', [
     'name',        # Save volume name to set on destination
     'size',        # Volume size reported by OpenStack, in GB
     'url',         # Final NBD export address from source conversion host
-    'state'        # STATE.Disk object for tracking progress
+    'state'        # Disk state dict for tracking progress
 ])
 
 
@@ -180,6 +179,12 @@ class OpenStackSourceHost(_BaseSourceHost):
         if 'source_disks' in data:
             self.source_disks = data['source_disks']
 
+        # Match for qemu_img progress percentage
+        self.qemu_progress_re = re.compile(r'\((\d+\.\d+)/100%\)')
+
+        # Global state instance
+        self.state = State().instance
+
     def prepare_exports(self):
         """ Attach the source VM's volumes to the source conversion host. """
         self._test_ssh_connection()
@@ -189,7 +194,6 @@ class OpenStackSourceHost(_BaseSourceHost):
         self._attach_volumes_to_converter()
         self._export_volumes_from_converter()
 
-    @disable_interrupt
     def close_exports(self):
         """ Put the source VM's volumes back where they were. """
         self._converter_close_exports()
@@ -204,7 +208,7 @@ class OpenStackSourceHost(_BaseSourceHost):
 
     def avoid_wrapper(self, host):
         """ Assume OpenStack to OpenStack migrations are always KVM to KVM. """
-        if isinstance(host, OpenstackHost):
+        if isinstance(host, OSPHost):
             logging.info('OpenStack->OpenStack migration, skipping virt-v2v.')
             return True
         return False
@@ -327,14 +331,14 @@ class OpenStackSourceHost(_BaseSourceHost):
                 logging.info('Volume is not in specified disk list, ignoring.')
                 continue
             dev_path = self._get_attachment(volume, sourcevm).device
-            disk = Disk(dev_path, 0)
+            disk = dict(path=dev_path, progress=0)
             self.volume_map[dev_path] = VolumeMapping(
                 source_dev=None, source_id=volume.id, dest_dev=None,
                 dest_id=None, snap_id=None, image_id=None, name=volume.name,
                 size=volume.size, url=None, state=disk)
-            STATE.disks.append(disk)
-            logging.debug('STATE.disks is now %s', STATE.disks)
-            STATE.write()
+            self.state['disks'].append(disk)
+            logging.debug('self.state.disks is now %s', self.state['disks'])
+            self.state.write()
 
     def _detach_data_volumes_from_source(self):
         """
@@ -384,14 +388,14 @@ class OpenStackSourceHost(_BaseSourceHost):
             volume = self.conn.create_volume(
                 image=image.id, bootable=True, wait=True, name=image.name,
                 timeout=DEFAULT_TIMEOUT, size=image.min_disk)
-            disk = Disk('/dev/vda', 0)
+            disk = dict(path='/dev/vda', progress=0)
             self.volume_map['/dev/vda'] = VolumeMapping(
                 source_dev=None, source_id=volume.id, dest_dev=None,
                 dest_id=None, snap_id=None, image_id=image.id,
                 name=volume.name, size=volume.size, url=None, state=disk)
-            STATE.disks.append(disk)
-            logging.debug('STATE.disks is now %s', STATE.disks)
-            STATE.write()
+            self.state['disks'].append(disk)
+            logging.debug('self.state.disks is now %s', self.state['disks'])
+            self.state.write()
         else:
             raise RuntimeError('No known boot device found for this instance!')
 
@@ -640,8 +644,8 @@ class OpenStackSourceHost(_BaseSourceHost):
                 description=volume.description, size=volume.size, wait=True,
                 timeout=DEFAULT_TIMEOUT)
             self.volume_map[path] = mapping._replace(dest_id=new_volume.id)
-            STATE.internal['disk_ids'][path] = new_volume.id
-        STATE.write()
+            self.state.internal['disk_ids'][path] = new_volume.id
+        self.state.write()
 
     @_use_lock(ATTACH_LOCK_FILE_DESTINATION)
     def _attach_destination_volumes(self):
@@ -691,10 +695,10 @@ class OpenStackSourceHost(_BaseSourceHost):
                         if err.errno != errno.EAGAIN:
                             raise
                     if line:
-                        matches = PreCopy.qemu_progress_re.search(line)
+                        matches = self.qemu_progress_re.search(line)
                         if matches is not None:
                             mapping.state.progress = float(matches.group(1))
-                            STATE.write()
+                            self.state.write()
                     else:
                         time.sleep(1)
                 logging.info('Conversion return code: %d', img_sub.returncode)
@@ -702,7 +706,7 @@ class OpenStackSourceHost(_BaseSourceHost):
                     raise RuntimeError('Failed to convert volume!')
                 # Just in case qemu-img returned before readline got to 100%
                 mapping.state.progress = 100.0
-                STATE.write()
+                self.state.write()
 
             try:
                 logging.info('Attempting initial sparsify...')
@@ -716,7 +720,7 @@ class OpenStackSourceHost(_BaseSourceHost):
                 logging.info('Overlay size: %s', str(os.path.getsize(overlay)))
 
                 cmd = ['virt-sparsify', '--in-place', overlay]
-                with open(STATE.wrapper_log, 'a') as log_fd:
+                with open(self.state.wrapper_log, 'a') as log_fd:
                     img_sub = subprocess.Popen(cmd,
                                                stdout=log_fd,
                                                stderr=subprocess.STDOUT,
