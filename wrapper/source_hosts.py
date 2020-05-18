@@ -19,11 +19,11 @@ import fcntl
 import json
 import logging
 import os
+import signal
 import subprocess
 import time
 from collections import namedtuple
 
-from .common import RUN_DIR, LOG_DIR, VDDK_LIBDIR, disable_interrupt
 from .hosts import OpenstackHost
 from .state import STATE, Disk
 from .pre_copy import PreCopy
@@ -180,10 +180,6 @@ class OpenStackSourceHost(_BaseSourceHost):
         if 'source_disks' in data:
             self.source_disks = data['source_disks']
 
-        # Allow UCI container ID (or name) to be passed in input JSON
-        self.uci_container = data.get('uci_container_image',
-                                      'v2v-conversion-host')
-
     def prepare_exports(self):
         """ Attach the source VM's volumes to the source conversion host. """
         self._test_ssh_connection()
@@ -270,7 +266,8 @@ class OpenStackSourceHost(_BaseSourceHost):
         """ Run a long-running command on the source conversion host. """
         address = self._converter().accessIPv4
         command, environment = self._ssh_cmd(address, args)
-        return subprocess.Popen(command, env=environment)
+        return subprocess.Popen(command, env=environment, stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     def _converter_scp(self, source, dest):
         """ Copy a file to the source conversion host. """
@@ -494,10 +491,9 @@ class OpenStackSourceHost(_BaseSourceHost):
 
     def _export_volumes_from_converter(self):
         """
-        SSH to source conversion host and start an NBD export. Start the UCI
-        with /dev/vdb, /dev/vdc, etc. attached, then pass JSON input to request
-        nbdkit exports from the V2V wrapper. Volume mapping step 4: fill in the
-        URL to the volume's matching NBD export.
+        SSH to source conversion host and start an NBD export. Pass JSON input 
+        to request nbdkit exports from the V2V wrapper. Volume mapping step 4:
+        fill in the URL to the volume's matching NBD export.
         """
         logging.info('Exporting volumes from source conversion host...')
 
@@ -505,80 +501,26 @@ class OpenStackSourceHost(_BaseSourceHost):
         self.tmpdir = self._converter_out(['mktemp', '-d', '-t', 'v2v-XXXXXX'])
         logging.info('Source conversion host temp dir: %s', self.tmpdir)
 
-        # Choose NBD ports for inside the container
+        # Choose NBD ports on the source conversion host
         port = 10809
         port_map = {}          # Map device path to port number, for export_nbd
-        reverse_port_map = {}  # Map port number to device path, for forwarding
-        nbd_ports = []         # podman arguments for NBD ports
-        device_list = []       # podman arguments for block devices
+        forward_ports = []
         for path, mapping in self.volume_map.items():
             volume_id = mapping.source_id
             dev_path = mapping.source_dev
-            uci_dev_path = mapping.source_dev+'-v2v'
             logging.info('Exporting %s from volume %s', dev_path, volume_id)
-            nbd_ports.extend(['-p', '127.0.0.1::{0}'.format(port)])
-            device_list.extend(['--device', dev_path+':'+uci_dev_path])
-            reverse_port_map[port] = path
-            port_map[uci_dev_path] = port
-            port += 1
-
-        # Copy the port map as input to the source conversion host wrapper
-        self._converter_val(['mkdir', '-p', self.tmpdir+'/lib'])
-        self._converter_val(['mkdir', '-p', self.tmpdir+'/log'])
-        self._converter_val(['mkdir', '-p', self.tmpdir+'/input'])
-        ports = json.dumps({'nbd_export_only': port_map})
-        export_input = '/tmp/nbd_conversion.json'
-        with open(export_input, 'w+') as conversion:
-            conversion.write(ports)
-        self._converter_scp(export_input, self.tmpdir+'/input/conversion.json')
-
-        # Run UCI on source conversion host. Create a temporary directory to
-        # use as the UCI's /data directory so more than one can run at a time.
-        ssh_args = ['sudo', 'podman', 'run', '--detach']
-        ssh_args.extend(['--volume', '/var/tmp:/var/tmp:z'])
-        ssh_args.extend(['--volume', '/var/lock:/var/lock:z'])
-        ssh_args.extend(['--volume', self.tmpdir+':/data:z'])
-        ssh_args.extend(['--volume', self.tmpdir+'/lib:'+RUN_DIR+':z'])
-        ssh_args.extend(['--volume', self.tmpdir+'/log:'+LOG_DIR+':z'])
-        ssh_args.extend(['--volume', '{0}:{0}'.format(VDDK_LIBDIR)])
-        ssh_args.extend(nbd_ports)
-        ssh_args.extend(device_list)
-        ssh_args.extend([self.uci_container])
-        self.uci_id = self._converter_out(ssh_args)
-        logging.debug('Source UCI container ID: %s', self.uci_id)
-
-        # Find the ports chosen by podman and forward them
-        ssh_args = ['sudo', 'podman', 'port', self.uci_id]
-        out = self._converter_out(ssh_args)
-        forward_ports = ['-N', '-T']
-        for line in out.split('\n'):  # Format: 10809/tcp -> 0.0.0.0:33437
-            logging.debug('Forwarding port from podman: %s', line)
-            internal_port, _, _ = line.partition('/')
-            _, _, external_port = line.rpartition(':')
-            try:
-                port = int(internal_port)
-            except ValueError:
-                raise RuntimeError('Could not get port number from podman on '
-                                   'source conversion host! Line was '+line)
-            path = reverse_port_map[port]
-            # The internal_port in the source conversion container is forwarded
-            # to external_port on the source conversion host, and then we need
-            # any local port on the destination conversion container to forward
-            # over SSH to that external_port. For simplicity, just choose the
-            # same as internal_port, so both source and destination containers
-            # use the same ports for the same NBD volumes. This is worth
-            # explaining in detail because otherwise the following arguments
-            # may look backwards at first glance.
-            forward_ports.extend(['-L',
-                                  '{}:localhost:{}'.format(internal_port,
-                                                           external_port)])
-            mapping = self.volume_map[path]
-            url = 'nbd://localhost:'+internal_port
+            port_map[dev_path] = port
+            forward_ports.extend(['-L', port+':localhost:'+port])
+            url = 'nbd://localhost:'+port
             self.volume_map[path] = mapping._replace(url=url)
             logging.info('Volume map so far: %s', self.volume_map)
+            port += 1
 
-        # Get SSH to forward the NBD ports to localhost
-        self.forwarding_process = self._converter_sub(forward_ports)
+        # Run wrapper on source conversion host with port map as input.
+        ssh_args = forward_ports + ['sudo', 'virt-v2v-wrapper']
+        self.export_process = self._converter_sub(ssh_args)
+        ports = json.dumps({'nbd_export_only': port_map})
+        self.export_process.stdin.write(ports)
 
         # Make sure export worked by checking the exports. The conversion
         # host on the source should create an 'nbdready' file after it has
@@ -599,15 +541,11 @@ class OpenStackSourceHost(_BaseSourceHost):
 
     def _converter_close_exports(self):
         """
-        SSH to source conversion host and close the NBD export. Currently this
-        pretty much amounts to just stopping the container.
+        SSH to source conversion host and close the NBD export process.
         """
         logging.info('Stopping export from source conversion host...')
-        try:
-            out = self._converter_out(['sudo', 'podman', 'stop', self.uci_id])
-            logging.info('Closed NBD export with result: %s', out)
-        except subprocess.CalledProcessError as err:
-            logging.debug('Error stopping UCI container on source: %s', err)
+        if self.export_process:
+            self.export_process.send_signal(signal.SIGINT)
 
         try:
             # Copy logs from temporary directory locally, and clean up source
@@ -619,8 +557,6 @@ class OpenStackSourceHost(_BaseSourceHost):
         except subprocess.CalledProcessError as err:
             logging.debug('Error copying logs from source: %s', err)
 
-        if self.forwarding_process:
-            self.forwarding_process.terminate()
 
     def _volume_still_attached(self, volume, vm):
         """ Check if a volume is still attached to a VM. """
