@@ -19,6 +19,7 @@ import fcntl
 import json
 import logging
 import os
+import pickle
 import re
 import select
 import signal
@@ -38,6 +39,12 @@ DEFAULT_TIMEOUT = 600            # Maximum wait for openstacksdk operations
 # mismatches between the OpenStack SDK and /dev in the VM.
 ATTACH_LOCK_FILE_SOURCE = '/var/lock/v2v-source-volume-lock'
 ATTACH_LOCK_FILE_DESTINATION = '/var/lock/v2v-destination-volume-lock'
+
+# File containing ports used by all the nbdkit processes running on the source
+# conversion host. There is a check to see if the port is available, but this
+# should speed things up.
+PORT_MAP_FILE = '/var/run/v2v-wrapper-ports'
+PORT_LOCK_FILE = '/var/lock/v2v-wrapper-lock' # Lock for the port map
 
 
 def detect_source_host(data, agent_sock, wrapper_log):
@@ -80,14 +87,16 @@ def _use_lock(lock_file):
                         logging.info('Waiting for lock %s...', lock_file)
                         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                         break
-                    except OSError:
+                    except (IOError, OSError) as err:
+                        if err.errno != errno.EAGAIN:
+                            raise
                         logging.info('Another conversion has the lock.')
                         time.sleep(1)
                 else:
                     raise RuntimeError(
                         'Unable to acquire lock {}!'.format(lock_file))
                 try:
-                    function(self)
+                    return function(self)
                 finally:
                     fcntl.flock(lock, fcntl.LOCK_UN)
         return wait_for_lock
@@ -180,7 +189,7 @@ class OpenStackSourceHost(_BaseSourceHost):
         self.volume_map = {}
 
         # SSH tunnel process
-        self.forwarding_process = None
+        self.export_process = None
 
         # If there is a specific list of disks to transfer, remember them so
         # only those disks get transferred.
@@ -196,6 +205,9 @@ class OpenStackSourceHost(_BaseSourceHost):
 
         # Use the same log file name on source conversion host
         self.log_file = wrapper_log
+
+        # Ports chosen for NBD export
+        self.claimed_ports = []
 
     def prepare_exports(self):
         """ Attach the source VM's volumes to the source conversion host. """
@@ -505,6 +517,88 @@ class OpenStackSourceHost(_BaseSourceHost):
                                                    self._converter_out,
                                                    update_source, volume_id))
 
+    def _test_port_available(self, port):
+        """
+        See if a port is open on the source conversion host by trying to listen
+        on it.
+        """
+        result = self._converter_val(['timeout', '1', 'nc', '-l', str(port)])
+        return result == 124 # Returned by 'timeout' when command timed out,
+                             # meaning nc was successful and the port is free.
+
+    @_use_lock(PORT_LOCK_FILE)
+    def _find_free_port(self):
+        # Reserve ports on the source conversion host. Lock a file containing
+        # the used ports, select some ports from the range that is unused, and
+        # check that the port is available on the source conversion host. Add
+        # this to the locked file and unlock it for the next conversion.
+        if not os.path.exists(PORT_MAP_FILE):
+            try:
+                os.mknod(PORT_MAP_FILE)
+            except FileExistsError as error:
+                pass
+
+        with open(PORT_MAP_FILE, 'rb+') as port_map_file:
+            # Try to read in the set of used ports
+            try:
+                used_ports = pickle.load(port_map_file)
+            except EOFError as error:
+                logging.info('Unable to read port map from %s, re-initializing'
+                    ' it...', port_map_file.name)
+                used_ports = set()
+
+            logging.info('Currently used ports: %s', str(used_ports))
+
+            # Choose ports from the available possibilities, and try to bind
+            ephemeral_ports = set(range(49152, 65535))
+            available_ports = ephemeral_ports-used_ports
+
+            try:
+                port = available_ports.pop()
+                while not self._test_port_available(port):
+                    logging.info('Port %d not available, trying another.', port)
+                    used_ports.add(port) # Mark used to avoid trying again
+                    port = available_ports.pop()
+            except KeyError as error:
+                raise RuntimeError('No free ports on conversion host!')
+            used_ports.add(port)
+            logging.info('Allocated port %d, all used: %s', port, used_ports)
+
+            # Write out and unlock the port map
+            logging.info('Writing out used ports: %s', used_ports)
+            pickle.dump(used_ports, port_map_file)
+            os.fsync(port_map_file)
+
+            logging.info('Returning port: %d', port)
+            self.claimed_ports.append(port)
+            logging.info('Returning port: %d', port)
+            return port
+
+
+    @_use_lock(PORT_LOCK_FILE)
+    def _release_ports(self):
+        with open(PORT_MAP_FILE, 'rb+') as port_map_file:
+            # Try to read in the set of used ports
+            try:
+                used_ports = pickle.load(port_map_file)
+            except EOFError as error:
+                logging.info('Unable to read port map file %s,'
+                    ' re-initializing it...', port_map_file.name)
+                used_ports = set()
+
+            logging.info('Cleanup: currently used ports: %s', used_ports)
+
+            for port in self.claimed_ports:
+                try:
+                    used_ports.remove(port)
+                except KeyError as err:
+                    logging.debug('Port already released? %d', port)
+
+            logging.info('Cleaning used ports: %s', used_ports)
+            pickle.dump(used_ports, port_map_file)
+            os.fsync(port_map_file)
+            port_map_file.close()
+
     def _export_volumes_from_converter(self):
         """
         SSH to source conversion host and start an NBD export. Pass JSON input 
@@ -514,10 +608,10 @@ class OpenStackSourceHost(_BaseSourceHost):
         logging.info('Exporting volumes from source conversion host...')
 
         # Choose NBD ports on the source conversion host
-        port = 10809
         port_map = {}          # Map device path to port number, for export_nbd
         forward_ports = []
         for path, mapping in self.volume_map.items():
+            port = self._find_free_port()
             volume_id = mapping.source_id
             dev_path = mapping.source_dev
             logging.info('Exporting %s from volume %s', dev_path, volume_id)
@@ -526,7 +620,6 @@ class OpenStackSourceHost(_BaseSourceHost):
             url = 'nbd://localhost:'+str(port)
             self.volume_map[path] = mapping._replace(url=url)
             logging.info('Volume map so far: %s', self.volume_map)
-            port += 1
 
         # Run wrapper on source conversion host with port map as input.
         ssh_args = forward_ports + ['sudo', 'virt-v2v-wrapper']
@@ -548,6 +641,8 @@ class OpenStackSourceHost(_BaseSourceHost):
         logging.info('Waiting for NBD exports from source container...')
         buf = ""
         for second in range(DEFAULT_TIMEOUT):
+            if self.export_process.poll():
+                raise RuntimeError('NBD volume export failed!')
             try:
                 line = self.export_process.stdout.readline()
             except (IOError, OSError) as err:
@@ -577,7 +672,7 @@ class OpenStackSourceHost(_BaseSourceHost):
         SSH to source conversion host and close the NBD export process.
         """
         logging.info('Stopping export from source conversion host...')
-        if self.export_process:  # If there's any stderr available, read it
+        if self.export_process and self.export_process.poll() is None:
             flags = fcntl.fcntl(self.export_process.stderr, fcntl.F_GETFL)
             flags |= os.O_NONBLOCK
             fcntl.fcntl(self.export_process.stderr, fcntl.F_SETFL, flags)
@@ -594,6 +689,8 @@ class OpenStackSourceHost(_BaseSourceHost):
             self._converter_scp_from(self.log_file, self.log_file+'.export')
         except subprocess.CalledProcessError as err:
             logging.debug('Error copying logs from source: %s', err)
+
+        self._release_ports()
 
 
     def _volume_still_attached(self, volume, vm):
