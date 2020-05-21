@@ -13,6 +13,7 @@ the nbd_export_only JSON, which will run a function in this module to manage
 the actual nbdkit exports.
 """
 
+import json
 import logging
 import os
 import signal
@@ -23,31 +24,34 @@ import time
 from .source_hosts import NBD_READY_SENTINEL, DEFAULT_TIMEOUT
 
 
-def export_nbd(port_map):
+def export_nbd(nbd_export_config):
     """
     Start one nbdkit process for every disk in the JSON input. Intended to be
-    run inside a UCI container inside a source conversion host.
+    run standalone inside a source conversion host.
     """
+    port_map = nbd_export_config['port_map']
+    log_file = nbd_export_config['log_file']
     log_format = '%(asctime)s:%(levelname)s:' \
         + ' %(message)s (%(module)s:%(lineno)d)'
     logging.basicConfig(
         level=logging.DEBUG,
-        filename='/data/virt-v2v-wrapper.log',
-        filemode='w',
+        filename=log_file,
+        filemode='a',
         format=log_format)
-    logger = logging.getLogger()
-    stdout_handler = logging.StreamHandler(sys.stdout)
-    stderr_handler = logging.StreamHandler(sys.stderr)
-    logger.addHandler(stdout_handler)
-    logger.addHandler(stderr_handler)
     logging.info('Starting up, map is %s', str(port_map))
 
     # Start one nbdkit process per disk, using the port specified in the map
     processes = {}
     for disk, port in port_map.items():
         logging.info('Exporting %s over NBD, port %s', disk, str(port))
-        cmd = ['nbdkit', '--exit-with-parent', '-p', str(port), 'file', disk]
-        processes[disk] = subprocess.Popen(cmd)
+#       TODO! Get nbdkit file plugin installed on RHOSP conversion appliance!
+#        cmd = ['nbdkit', '--exit-with-parent', '--ipaddr', '127.0.0.1',
+#               '--port', str(port), 'file', disk]
+#       Fall back to qemu-nbd for now
+        cmd = ['qemu-nbd', '-p', str(port), '-b', '127.0.0.1', '--read-only',
+               '--persistent', '--verbose', disk]
+        processes[disk] = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                           stderr=subprocess.PIPE)
 
     # Check qemu-img info on all the disks to make sure everything is ready
     logging.info('Waiting for valid qemu-img info on all exports...')
@@ -70,12 +74,13 @@ def export_nbd(port_map):
     else:
         raise RuntimeError('Timed out starting nbdkit exports!')
 
-    # Signal readiness by writing out an 'nbdready' file. The wrapper running
-    # on the destination conversion host will poll for this file before trying
-    # to do anything with the NBD export URL.
-    sentinel = os.path.join('/data', NBD_READY_SENTINEL)
-    with open(sentinel, 'w') as ready:
-        ready.write('NBD exports ready')
+    # Signal readiness by printing a status message to stdout. The wrapper on
+    # the destination conversion host should be waiting for this status to
+    # continue with the transfer.
+    ready = json.dumps({'nbd_export_only': 'ready'})
+    sys.stdout.write(ready)
+    sys.stdout.write('\n')
+    sys.stdout.flush()
 
     # Wait until told to stop
     signal.pause()

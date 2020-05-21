@@ -19,12 +19,15 @@ import fcntl
 import json
 import logging
 import os
+import re
+import select
 import signal
 import subprocess
 import time
 from collections import namedtuple
 
 from .hosts import OSPHost
+from .runners import DEVNULL
 from .singleton import State
 
 
@@ -36,14 +39,11 @@ DEFAULT_TIMEOUT = 600            # Maximum wait for openstacksdk operations
 ATTACH_LOCK_FILE_SOURCE = '/var/lock/v2v-source-volume-lock'
 ATTACH_LOCK_FILE_DESTINATION = '/var/lock/v2v-destination-volume-lock'
 
-# Local directory to copy logs from source conversion host
-SOURCE_LOGS_DIR = '/data/source_logs'
 
-
-def detect_source_host(data, agent_sock):
+def detect_source_host(data, agent_sock, wrapper_log):
     """ Create the right source host object based on the input data. """
     if 'osp_source_environment' in data:
-        return OpenStackSourceHost(data, agent_sock)
+        return OpenStackSourceHost(data, agent_sock, wrapper_log)
     return None
 
 
@@ -132,12 +132,25 @@ VolumeMapping = namedtuple('VolumeMapping', [
 class OpenStackSourceHost(_BaseSourceHost):
     """ Export volumes from an OpenStack instance. """
 
-    def __init__(self, data, agent_sock):
+    def __init__(self, data, agent_sock, wrapper_log):
+        initial_loggers = set(logging.root.manager.loggerDict.keys())
         try:
             import openstack
         except ImportError:
             raise RuntimeError('OpenStack SDK is not installed on this '
                                'conversion host!')
+
+        # The main virt-v2v-wrapper module sets DEBUG level on the root logger,
+        # so messages from the OpenStack SDK can end up there too. Try extra
+        # hard to suppress the torrent of logging by setting INFO level on the
+        # loggers added during the openstack import.
+        openstack.enable_logging(debug=False, http_debug=False, stream=None)
+        updated_loggers = set(logging.root.manager.loggerDict.keys())
+        openstack_loggers = updated_loggers-initial_loggers
+        for log_name in openstack_loggers:
+            logger = logging.getLogger(log_name)
+            logger.setLevel(logging.INFO)
+            logging.info('Silenced OpenStack logger '+log_name)
 
         # Create a connection to the source cloud
         osp_env = data['osp_source_environment']
@@ -155,7 +168,6 @@ class OpenStackSourceHost(_BaseSourceHost):
         self.dest_conn = openstack.connect(**osp_args)
 
         self.agent_sock = agent_sock
-        openstack.enable_logging(debug=False, http_debug=False, stream=None)
 
         if self._converter() is None:
             raise RuntimeError('Cannot find source instance {}'.format(
@@ -166,9 +178,6 @@ class OpenStackSourceHost(_BaseSourceHost):
 
         # Build up a list of VolumeMappings keyed by the original device path
         self.volume_map = {}
-
-        # Temporary directory for logs on source conversion host
-        self.tmpdir = None
 
         # SSH tunnel process
         self.forwarding_process = None
@@ -184,6 +193,9 @@ class OpenStackSourceHost(_BaseSourceHost):
 
         # Global state instance
         self.state = State().instance
+
+        # Use the same log file name on source conversion host
+        self.log_file = wrapper_log
 
     def prepare_exports(self):
         """ Attach the source VM's volumes to the source conversion host. """
@@ -501,10 +513,6 @@ class OpenStackSourceHost(_BaseSourceHost):
         """
         logging.info('Exporting volumes from source conversion host...')
 
-        # Create a temporary directory on source conversion host
-        self.tmpdir = self._converter_out(['mktemp', '-d', '-t', 'v2v-XXXXXX'])
-        logging.info('Source conversion host temp dir: %s', self.tmpdir)
-
         # Choose NBD ports on the source conversion host
         port = 10809
         port_map = {}          # Map device path to port number, for export_nbd
@@ -514,8 +522,8 @@ class OpenStackSourceHost(_BaseSourceHost):
             dev_path = mapping.source_dev
             logging.info('Exporting %s from volume %s', dev_path, volume_id)
             port_map[dev_path] = port
-            forward_ports.extend(['-L', port+':localhost:'+port])
-            url = 'nbd://localhost:'+port
+            forward_ports.extend(['-L', '{0}:localhost:{0}'.format(port)])
+            url = 'nbd://localhost:'+str(port)
             self.volume_map[path] = mapping._replace(url=url)
             logging.info('Volume map so far: %s', self.volume_map)
             port += 1
@@ -523,41 +531,67 @@ class OpenStackSourceHost(_BaseSourceHost):
         # Run wrapper on source conversion host with port map as input.
         ssh_args = forward_ports + ['sudo', 'virt-v2v-wrapper']
         self.export_process = self._converter_sub(ssh_args)
-        ports = json.dumps({'nbd_export_only': port_map})
-        self.export_process.stdin.write(ports)
+        flags = fcntl.fcntl(self.export_process.stdout, fcntl.F_GETFL)
+        flags |= os.O_NONBLOCK
+        fcntl.fcntl(self.export_process.stdout, fcntl.F_SETFL, flags)
 
-        # Make sure export worked by checking the exports. The conversion
-        # host on the source should create an 'nbdready' file after it has
-        # started all the nbdkit processes, and after that qemu-img info
+        ports = json.dumps({'nbd_export_only': {'port_map': port_map,
+                                                'log_file': self.log_file}})
+        logging.info('Input to source wrapper: '+ports)
+        self.export_process.stdin.write(ports)
+        self.export_process.stdin.close()
+
+        # Make sure export worked by checking the exports. The wrapper on the
+        # source conversion host will write a 'ready' status to stdout after it
+        # has started all the nbdkit processes, and after that qemu-img info
         # should be able to read them.
         logging.info('Waiting for NBD exports from source container...')
-        sentinel = os.path.join(self.tmpdir, NBD_READY_SENTINEL)
+        buf = ""
         for second in range(DEFAULT_TIMEOUT):
-            if self._converter_val(['test', '-f', sentinel]) == 0:
+            try:
+                line = self.export_process.stdout.readline()
+            except (IOError, OSError) as err:
+                if err.errno != errno.EAGAIN:
+                    raise
+                time.sleep(1)
+                continue
+            if line:
+                buf += line
+            try:
+                json_result = json.loads(buf)
                 break
-            time.sleep(1)
+            except ValueError:
+                time.sleep(1)
         else:
             raise RuntimeError('Timed out waiting for NBD export!')
         for path, mapping in self.volume_map.items():
             cmd = ['qemu-img', 'info', mapping.url]
-            image_info = subprocess.check_output(cmd)
-            logging.info('qemu-img info for %s: %s', path, image_info)
+            try:
+                image_info = subprocess.check_output(cmd)
+                logging.info('qemu-img info for %s: %s', path, image_info)
+            except subprocess.CalledProcessError as err:
+                raise RuntimeError('Error with NBD volume export: '+str(err))
 
     def _converter_close_exports(self):
         """
         SSH to source conversion host and close the NBD export process.
         """
         logging.info('Stopping export from source conversion host...')
-        if self.export_process:
-            self.export_process.send_signal(signal.SIGINT)
+        if self.export_process:  # If there's any stderr available, read it
+            flags = fcntl.fcntl(self.export_process.stderr, fcntl.F_GETFL)
+            flags |= os.O_NONBLOCK
+            fcntl.fcntl(self.export_process.stderr, fcntl.F_SETFL, flags)
+            try:
+                err = self.export_process.stderr.read()
+                logging.debug('NBD export stderr: '+err)
+            except (IOError, OSError) as err:
+                if err.errno != errno.EAGAIN:
+                    raise
+            self.export_process.terminate()
 
         try:
             # Copy logs from temporary directory locally, and clean up source
-            if self.tmpdir:
-                os.makedirs(SOURCE_LOGS_DIR, exist_ok=True)
-                self._converter_scp_from(self.tmpdir+'/*', SOURCE_LOGS_DIR,
-                                         recursive=True)
-                self._converter_out(['sudo', 'rm', '-rf', self.tmpdir])
+            self._converter_scp_from(self.log_file, self.log_file+'.export')
         except subprocess.CalledProcessError as err:
             logging.debug('Error copying logs from source: %s', err)
 
@@ -644,7 +678,7 @@ class OpenStackSourceHost(_BaseSourceHost):
                 description=volume.description, size=volume.size, wait=True,
                 timeout=DEFAULT_TIMEOUT)
             self.volume_map[path] = mapping._replace(dest_id=new_volume.id)
-            self.state.internal['disk_ids'][path] = new_volume.id
+            self.state['internal']['disk_ids'][path] = new_volume.id
         self.state.write()
 
     @_use_lock(ATTACH_LOCK_FILE_DESTINATION)
@@ -683,7 +717,7 @@ class OpenStackSourceHost(_BaseSourceHost):
                 img_sub = subprocess.Popen(cmd,
                                            stdout=subprocess.PIPE,
                                            stderr=subprocess.STDOUT,
-                                           stdin=subprocess.DEVNULL,
+                                           stdin=DEVNULL,
                                            universal_newlines=True, bufsize=1)
                 flags = fcntl.fcntl(img_sub.stdout, fcntl.F_GETFL)
                 flags |= os.O_NONBLOCK
@@ -691,13 +725,14 @@ class OpenStackSourceHost(_BaseSourceHost):
                 while img_sub.poll() is None:
                     try:
                         line = img_sub.stdout.readline()
-                    except OSError as err:
+                    except (IOError, OSError) as err:
                         if err.errno != errno.EAGAIN:
                             raise
+                        continue
                     if line:
                         matches = self.qemu_progress_re.search(line)
                         if matches is not None:
-                            mapping.state.progress = float(matches.group(1))
+                            mapping.state['progress'] = float(matches.group(1))
                             self.state.write()
                     else:
                         time.sleep(1)
@@ -705,7 +740,7 @@ class OpenStackSourceHost(_BaseSourceHost):
                 if img_sub.returncode != 0:
                     raise RuntimeError('Failed to convert volume!')
                 # Just in case qemu-img returned before readline got to 100%
-                mapping.state.progress = 100.0
+                mapping.state['progress'] = 100.0
                 self.state.write()
 
             try:
@@ -720,11 +755,11 @@ class OpenStackSourceHost(_BaseSourceHost):
                 logging.info('Overlay size: %s', str(os.path.getsize(overlay)))
 
                 cmd = ['virt-sparsify', '--in-place', overlay]
-                with open(self.state.wrapper_log, 'a') as log_fd:
+                with open(self.log_file, 'a') as log_fd:
                     img_sub = subprocess.Popen(cmd,
                                                stdout=log_fd,
                                                stderr=subprocess.STDOUT,
-                                               stdin=subprocess.DEVNULL,
+                                               stdin=DEVNULL,
                                                env=environment)
                     returncode = img_sub.wait()
                     logging.info('Sparsify return code: %d', returncode)

@@ -571,7 +571,7 @@ def main():
                     data, host.get_uid(), host.get_gid())
                 if agent_pid is None:
                     raise RuntimeError('Failed to start ssh-agent')
-            source_host = detect_source_host(data, agent_sock)
+            source_host = detect_source_host(data, agent_sock, wrapper_log)
             if avoid_wrapper(source_host, host):
                 migrate_instance(source_host, host)
             else:  # TODO: allow connecting source hosts to virt-v2v
