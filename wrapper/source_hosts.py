@@ -24,6 +24,7 @@ import re
 import select
 import signal
 import subprocess
+import uuid
 import time
 from collections import namedtuple
 
@@ -208,6 +209,9 @@ class OpenStackSourceHost(_BaseSourceHost):
 
         # Ports chosen for NBD export
         self.claimed_ports = []
+
+        # Create process marker for remote copy of virt-v2v-wrapper
+        self.v2v_uuid = str(uuid.uuid4())
 
     def prepare_exports(self):
         """ Attach the source VM's volumes to the source conversion host. """
@@ -538,7 +542,7 @@ class OpenStackSourceHost(_BaseSourceHost):
             except FileExistsError as error:
                 pass
 
-        with open(PORT_MAP_FILE, 'rb+') as port_map_file:
+        with open(PORT_MAP_FILE, 'rb') as port_map_file:
             # Try to read in the set of used ports
             try:
                 used_ports = pickle.load(port_map_file)
@@ -564,20 +568,18 @@ class OpenStackSourceHost(_BaseSourceHost):
             used_ports.add(port)
             logging.info('Allocated port %d, all used: %s', port, used_ports)
 
-            # Write out and unlock the port map
+        with open(PORT_MAP_FILE, 'wb') as port_map_file:
             logging.info('Writing out used ports: %s', used_ports)
             pickle.dump(used_ports, port_map_file)
             os.fsync(port_map_file)
 
-            logging.info('Returning port: %d', port)
-            self.claimed_ports.append(port)
-            logging.info('Returning port: %d', port)
-            return port
+        self.claimed_ports.append(port)
+        return port
 
 
     @_use_lock(PORT_LOCK_FILE)
     def _release_ports(self):
-        with open(PORT_MAP_FILE, 'rb+') as port_map_file:
+        with open(PORT_MAP_FILE, 'rb') as port_map_file:
             # Try to read in the set of used ports
             try:
                 used_ports = pickle.load(port_map_file)
@@ -594,10 +596,10 @@ class OpenStackSourceHost(_BaseSourceHost):
                 except KeyError as err:
                     logging.debug('Port already released? %d', port)
 
+        with open(PORT_MAP_FILE, 'wb') as port_map_file:
             logging.info('Cleaning used ports: %s', used_ports)
             pickle.dump(used_ports, port_map_file)
             os.fsync(port_map_file)
-            port_map_file.close()
 
     def _export_volumes_from_converter(self):
         """
@@ -622,7 +624,7 @@ class OpenStackSourceHost(_BaseSourceHost):
             logging.info('Volume map so far: %s', self.volume_map)
 
         # Run wrapper on source conversion host with port map as input.
-        ssh_args = forward_ports + ['sudo', 'virt-v2v-wrapper']
+        ssh_args = forward_ports + ['sudo', 'virt-v2v-wrapper', self.v2v_uuid]
         self.export_process = self._converter_sub(ssh_args)
         flags = fcntl.fcntl(self.export_process.stdout, fcntl.F_GETFL)
         flags |= os.O_NONBLOCK
@@ -689,6 +691,46 @@ class OpenStackSourceHost(_BaseSourceHost):
             self._converter_scp_from(self.log_file, self.log_file+'.export')
         except subprocess.CalledProcessError as err:
             logging.debug('Error copying logs from source: %s', err)
+
+        # Get top-level sudo wrapper PID
+        sudo_wrapper_pid = None
+        try:
+            pattern = "'sudo virt-v2v-wrapper "+self.v2v_uuid+"'"
+            pids = self._converter_out(['pgrep', '-f', pattern]).split('\n')
+            if len(pids) > 1:
+                logging.debug('Multiple PIDs matched UUID: %s', ' '.join(pids))
+            sudo_wrapper_pid = pids[0]
+            logging.debug('Remote sudo wrapper PID: %s', sudo_wrapper_pid)
+        except subprocess.CalledProcessError as err:
+            logging.debug('Unable to get remote sudo wrapper PID! %s', str(err))
+
+        # Get real wrapper PID
+        wrapper_pid = None
+        if sudo_wrapper_pid:
+            try:
+                pids = self._converter_out(['pgrep', '-P', sudo_wrapper_pid])
+                pids = pids.split('\n')
+                if len(pids) > 1:
+                    logging.debug('Multiple child PIDs: %s', ' '.join(pids))
+                wrapper_pid = pids[0]
+                logging.debug('Remote wrapper PID: %s', wrapper_pid)
+            except subprocess.CalledProcessError as err:
+                logging.debug('Unable to get remote wrapper PID! %s', str(err))
+
+        # Stop all children of the real wrapper process (NBD exports)
+        if wrapper_pid:
+            try:
+                out = self._converter_out(['sudo', 'pkill', '-P', wrapper_pid])
+                logging.debug('Stopped NBD exports. %s', out)
+            except subprocess.CalledProcessError as err:
+                logging.debug('Unable to stop NBD exports! %s', str(err))
+
+        # Stop the real wrapper
+        try:
+            out = self._converter_out(['sudo', 'kill', wrapper_pid])
+            logging.debug('Stopped remote virt-v2v-wrapper: %s', out)
+        except subprocess.CalledProcessError as err:
+            logging.debug('Unable to stop remote wrapper: %s', str(err))
 
         self._release_ports()
 
